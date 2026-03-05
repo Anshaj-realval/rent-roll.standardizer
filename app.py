@@ -17,7 +17,7 @@ def check_password():
         """Checks whether a password entered by the user is correct."""
         if st.session_state["password"] == st.secrets["password"]:
             st.session_state["password_correct"] = True
-            del st.session_state["password"]  # Don\"t store password
+            del st.session_state["password"]  # Don\'t store password
         else:
             st.session_state["password_correct"] = False
 
@@ -58,7 +58,8 @@ def standardize_rent_roll_with_claude(df: pd.DataFrame) -> pd.DataFrame:
         # Using to_csv for simplicity, but could be more structured (e.g., JSON list of dicts)
         chunk_csv = chunk_df.to_csv(index=False)
 
-        prompt_message = f"""
+        # Using a raw string for the prompt message to avoid issues with backslashes
+        prompt_message = fr"""
         You are an expert in multifamily real estate underwriting. Your task is to standardize rent roll data.
         The user will provide a CSV string representing a portion of a rent roll. Convert this data into a standardized one-line-per-tenant format.
 
@@ -69,11 +70,11 @@ def standardize_rent_roll_with_claude(df: pd.DataFrame) -> pd.DataFrame:
 
         STANDARDIZATION RULES:
         - Each tenant must appear on only one row.
-        - Convert any annual rents to monthly rents. If a rent column name suggests annual (e.g., \'Annual Rent\'), divide by 12.
-        - If rent per square foot is given, calculate the total rent. Look for columns like \'Rent/SF\' and \'Unit Size (SF)\'.
+        - Convert any annual rents to monthly rents. If a rent column name suggests annual (e.g., 'Annual Rent'), divide by 12.
+        - If rent per square foot is given, calculate the total rent. Look for columns like 'Rent/SF' and 'Unit Size (SF)'.
         - Normalize all dates to MM/DD/YYYY format. Handle various date formats (e.g., YYYY-MM-DD, M/D/YY).
-        - Remove duplicate rows based on a combination of \'Unit No\' and \'Tenant Name\'.
-        - Ignore fully vacant rows unless market rent is provided. A row is fully vacant if \'Tenant Name\' is empty/null and \'Market Rent (Monthly)\' is also empty/null or zero.
+        - Remove duplicate rows based on a combination of 'Unit No' and 'Tenant Name'.
+        - Ignore fully vacant rows unless market rent is provided. A row is fully vacant if 'Tenant Name' is empty/null and 'Market Rent (Monthly)' is also empty/null or zero.
         - Admin/model units must be included.
         - Ensure all required columns are present in the output. If a column is missing from the input and cannot be derived, use null or an appropriate default.
 
@@ -131,7 +132,8 @@ def standardize_rent_roll_with_claude(df: pd.DataFrame) -> pd.DataFrame:
 
     # Convert date columns to datetime objects, then format to MM/DD/YYYY
     for date_col in ["Lease Start Date", "Lease End Date"]:
-        final_standardized_df[date_col] = pd.to_datetime(final_standardized_df[date_col], errors=\'coerce\').dt.strftime(\'%m/%d/%Y\')
+        # Using a raw string for the strftime format to avoid backslash issues
+        final_standardized_df[date_col] = pd.to_datetime(final_standardized_df[date_col], errors='coerce').dt.strftime(r'%m/%d/%Y')
 
     # Remove duplicate rows again after combining, based on Unit No and Tenant Name
     final_standardized_df.drop_duplicates(subset=["Unit No", "Tenant Name"], inplace=True)
@@ -186,14 +188,14 @@ if check_password():
                         ]
                         missing_cols = [col for col in required_columns if col not in standardized_df.columns or standardized_df[col].isnull().all()]
                         if missing_cols:
-                            st.warning(f"Missing or entirely null required columns: {\', \'.join(missing_cols)}")
+                            st.warning(f"Missing or entirely null required columns: {', '.join(missing_cols)}")
                         else:
                             st.info("All required columns are present.")
 
                         # Provide download button for the standardized file
                         output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine=\'xlsxwriter\') as writer:
-                            standardized_df.to_excel(writer, index=False, sheet_name=\'Standardized Rent Roll\')
+                        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                            standardized_df.to_excel(writer, index=False, sheet_name='Standardized Rent Roll')
                         processed_data = output.getvalue()
 
                         st.download_button(
