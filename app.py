@@ -6,7 +6,7 @@ from anthropic import Anthropic
 import json
 
 # --- Configuration ---
-CLAUDE_MODEL = "claude-3-opus-20240229" # Or other suitable Claude model
+CLAUDE_MODEL = "claude-sonnet-4-20250514" # Or other suitable Claude model
 CHUNK_SIZE = 100 # Number of rows per chunk for Claude processing
 
 # --- Security: Simple Password Gate ---
