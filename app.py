@@ -223,7 +223,7 @@ if check_password():
 
             # --- Download ---
             output = io.BytesIO()
-            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 standardized_df.to_excel(writer, index=False, sheet_name="Standardized Rent Roll")
             output.seek(0)
 
