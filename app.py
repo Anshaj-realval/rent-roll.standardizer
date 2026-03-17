@@ -4,23 +4,24 @@ import io
 import re
 import json
 import time
+import asyncio
 from datetime import date
-from anthropic import Anthropic
+from anthropic import Anthropic, AsyncAnthropic
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-CLAUDE_MODEL  = "claude-haiku-4-5-20251001"
-OVERLAP_ROWS  = 8
-MAX_RETRIES   = 3
-PROMPT_VERSION = "v4.0"
+CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
+OVERLAP_ROWS   = 8
+MAX_RETRIES    = 3
+PROMPT_VERSION = "v5.0"
 
-# Chunk size auto-scales based on file size
+# Larger chunks = fewer API calls = lower cost
 def get_chunk_size(total_rows: int) -> int:
-    if total_rows < 100:  return total_rows   # single chunk
-    if total_rows > 800:  return 40            # large file — smaller chunks
-    return 60                                   # standard
+    if total_rows < 150:  return total_rows   # single chunk — no splitting
+    if total_rows > 800:  return 80            # large file
+    return 100                                  # standard — up from 60
 
 st.set_page_config(
     page_title="RealVal · Rent Roll Standardizer",
@@ -306,124 +307,129 @@ def render_steps(active: int) -> str:
     return html
 
 
-# ── CLAUDE CALL ───────────────────────────────────────────────────────────────
-def call_claude(client, chunk_text: str, chunk_num: int, total_chunks: int,
-                analyst_hint: str, library_ctx: str) -> list:
+# ── COMPACT PROMPT BUILDER ────────────────────────────────────────────────────
+# Kept terse deliberately — every token sent per chunk costs money.
+# Full rules fit in ~120 tokens vs the previous ~600-word version.
+def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
+                 analyst_hint: str, library_ctx: str) -> str:
+    hint = f"\nNOTE: {analyst_hint.strip()}" if analyst_hint.strip() else ""
+    return f"""Multifamily rent roll standardizer. ({PROMPT_VERSION})
+Output: JSON array, 7 columns + optional flag field.
+Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Lease Start Date | Lease End Date | Tenant Name
 
-    hint_section = f"\nANALYST NOTE: {analyst_hint.strip()}" if analyst_hint.strip() else ""
-
-    prompt = f"""You are an expert multifamily real estate underwriting analyst. ({PROMPT_VERSION})
-Standardize the rent roll excerpt below into a clean JSON array.
-
-OUTPUT COLUMNS (exactly these 7 + optional flag):
-Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Lease Start Date | Lease End Date | Tenant Name
-
-RULES — follow precisely:
-1. ONE ROW PER UNIT. Merge all charge sub-rows for the same unit into a single output row.
-2. Effective Rent = base rent charge ("rent" line) ONLY.
-   ADD: housing subsidy (rentsub, hap, subsidy) if present.
-   DO NOT ADD OR SUBTRACT anything else — no deposits, no utilities, no pet fees,
-   no parking, no amenity fees, no trash, no employee discounts, no concessions,
-   no late fees. Nothing. Only rent + subsidy.
-3. Annual rents → divide by 12. Rent/SF given → multiply by SF for monthly rent.
-4. Dates → MM/DD/YYYY. Missing date → null.
-5. VACANT units: include if market rent shown. Effective Rent = null. Tenant Name = "VACANT".
-6. ADMIN / MODEL units: include. Effective Rent = null. Tenant Name = "ADMIN" or "MODEL".
-7. Future leases (no active rent charge, future move-in date): EXCLUDE entirely.
-8. Section headers, subtotal rows, summary rows, footer rows: EXCLUDE entirely.
-9. Duplicate unit numbers: keep only the first occurrence (current tenant).
-10. Monetary values: round to 2 decimal places.
-11. CONFIDENCE FLAG: Add "flag": true to any row you are uncertain about (ambiguous format,
-    missing key data, unusual values). Omit "flag" or set false for confident rows.
-
-IMPORTANT: Do not skip any unit that has a unit number. Missing units cause reconciliation failures.
-{hint_section}
+Rules:
+1. 1 row/unit — merge all charge sub-rows per unit.
+2. EffRent = base rent + rentsub/hap/subsidy ONLY. Exclude everything else (deposits, fees, utilities, discounts, etc).
+3. Annual rent÷12. Rent/SF×SF=monthly.
+4. Dates→MM/DD/YYYY or null.
+5. VACANT: include, EffRent=null, Name="VACANT".
+6. ADMIN/MODEL: include, EffRent=null, Name="ADMIN"/"MODEL".
+7. Exclude future leases (no active rent charge).
+8. Exclude headers, subtotals, footers.
+9. Duplicate unit# → keep first only.
+10. Round money to 2 decimals.
+11. Add "flag":true if uncertain about any row.
+Never skip a unit that has a unit number.{hint}
 {library_ctx}
+Return raw JSON array only — no fences, no text. Start with [ end with ].
 
-Return ONLY a raw JSON array — no markdown fences, no commentary.
-Start with [ and end with ].
-
-Rent roll data (chunk {chunk_num} of {total_chunks}):
+Data (chunk {chunk_num}/{total_chunks}):
 {chunk_text}"""
 
-    resp = client.messages.create(
-        model=CLAUDE_MODEL, max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    raw = resp.content[0].text.strip()
-    raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\n?```\s*$",           "", raw, flags=re.MULTILINE)
-    return json.loads(raw.strip())
+
+# ── ASYNC CLAUDE CALL (single chunk) ─────────────────────────────────────────
+async def call_claude_async(client: AsyncAnthropic, chunk_text: str,
+                             chunk_num: int, total_chunks: int,
+                             analyst_hint: str, library_ctx: str) -> tuple[int, list]:
+    """Returns (chunk_num, rows) so results can be re-ordered after gather()."""
+    prompt = build_prompt(chunk_text, chunk_num, total_chunks, analyst_hint, library_ctx)
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            resp = await client.messages.create(
+                model=CLAUDE_MODEL, max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            raw = resp.content[0].text.strip()
+            raw = re.sub(r"^```(?:json)?\s*\n?", "", raw, flags=re.MULTILINE)
+            raw = re.sub(r"\n?```\s*$",           "", raw, flags=re.MULTILINE)
+            rows = json.loads(raw.strip())
+            return (chunk_num, rows)
+        except json.JSONDecodeError as e:
+            last_error = f"JSON error chunk {chunk_num} (attempt {attempt+1}): {e}"
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            last_error = f"Error chunk {chunk_num} (attempt {attempt+1}): {e}"
+            await asyncio.sleep(1.5)
+    raise RuntimeError(last_error)
 
 
 # ── POST-PROCESSING VALIDATION ────────────────────────────────────────────────
 def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Flag rows where Effective Rent looks wrong."""
     mkt = pd.to_numeric(df["Market Rent (Monthly)"],    errors="coerce")
     eff = pd.to_numeric(df["Effective Rent (Monthly)"], errors="coerce")
-
-    # Already-flagged by Claude
     if "flag" not in df.columns:
         df["flag"] = False
     df["flag"] = df["flag"].fillna(False).astype(bool)
-
-    # Python-level checks
-    occupied_mask = ~df["Tenant Name"].str.upper().isin(["VACANT","ADMIN","MODEL"]) & df["Tenant Name"].notna()
-    too_high  = occupied_mask & eff.notna() & mkt.notna() & (eff > mkt * 2)
-    too_low   = occupied_mask & eff.notna() & (eff < 100)
-
-    df.loc[too_high | too_low, "flag"] = True
+    occ = ~df["Tenant Name"].str.upper().isin(["VACANT","ADMIN","MODEL"]) & df["Tenant Name"].notna()
+    df.loc[occ & eff.notna() & mkt.notna() & (eff > mkt * 2), "flag"] = True
+    df.loc[occ & eff.notna() & (eff < 100), "flag"] = True
     return df
 
 
-# ── STANDARDIZE ───────────────────────────────────────────────────────────────
+# ── PARALLEL STANDARDIZE ──────────────────────────────────────────────────────
 def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library_ctx):
-    client      = Anthropic(api_key=st.secrets["anthropic_api_key"])
-    total_rows  = len(df)
-    chunk_size  = get_chunk_size(total_rows)
-    all_results = []
+    api_key    = st.secrets["anthropic_api_key"]
+    total_rows = len(df)
+    chunk_size = get_chunk_size(total_rows)
 
     step_ph.markdown(render_steps(2), unsafe_allow_html=True)
 
-    # Build chunks with overlap
+    # Build chunks with overlap to prevent boundary unit loss
     chunks, start = [], 0
     while start < total_rows:
         end = min(start + chunk_size, total_rows)
-        chunks.append(df.iloc[start:end])
+        chunks.append((len(chunks) + 1, df.iloc[start:end].to_csv(index=False)))
         if end == total_rows: break
         start += chunk_size - OVERLAP_ROWS
 
     num_chunks = len(chunks)
-    for i, chunk in enumerate(chunks):
-        status_ph.markdown(
-            f"<small style='color:rgba(255,255,255,0.4);'>Chunk {i+1}/{num_chunks} · "
-            f"{len(chunk)} rows · chunk_size={chunk_size}</small>", unsafe_allow_html=True)
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                rows = call_claude(client, chunk.to_csv(index=False),
-                                   i+1, num_chunks, analyst_hint, library_ctx)
-                all_results.extend(rows)
-                last_error = None
-                break
-            except json.JSONDecodeError as e:
-                last_error = f"JSON error chunk {i+1} (attempt {attempt+1}/{MAX_RETRIES}): {e}"
-                time.sleep(1.5)
-            except Exception as e:
-                last_error = f"Error chunk {i+1} (attempt {attempt+1}/{MAX_RETRIES}): {e}"
-                time.sleep(1.5)
-        if last_error:
-            status_ph.empty(); st.error(last_error)
-            return pd.DataFrame()
-        prog_ph.progress((i+1)/num_chunks)
+    status_ph.markdown(
+        f"<small style='color:rgba(255,255,255,0.4);'>"
+        f"Sending {num_chunks} chunk{'s' if num_chunks>1 else ''} in parallel · "
+        f"{total_rows} rows · chunk size {chunk_size}</small>",
+        unsafe_allow_html=True
+    )
 
+    # ── Run all chunks concurrently ──
+    async def run_all():
+        async_client = AsyncAnthropic(api_key=api_key)
+        tasks = [
+            call_claude_async(async_client, csv_text, chunk_num, num_chunks,
+                              analyst_hint, library_ctx)
+            for chunk_num, csv_text in chunks
+        ]
+        return await asyncio.gather(*tasks)
+
+    try:
+        results = asyncio.run(run_all())
+    except RuntimeError as e:
+        status_ph.empty()
+        st.error(str(e))
+        return pd.DataFrame()
+
+    prog_ph.progress(1.0)
     status_ph.empty()
     step_ph.markdown(render_steps(3), unsafe_allow_html=True)
 
-    if not all_results:
+    # Re-order by chunk number and flatten
+    results_sorted = sorted(results, key=lambda x: x[0])
+    all_rows = [row for _, chunk_rows in results_sorted for row in chunk_rows]
+
+    if not all_rows:
         return pd.DataFrame()
 
-    result_df = pd.DataFrame(all_results)
+    result_df = pd.DataFrame(all_rows)
     COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)",
             "Effective Rent (Monthly)","Lease Start Date","Lease End Date","Tenant Name"]
     for col in COLS:
@@ -435,8 +441,6 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
 
     result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
     result_df.reset_index(drop=True, inplace=True)
-
-    # Post-processing validation
     result_df = validate_rows(result_df)
 
     step_ph.markdown(render_steps(4), unsafe_allow_html=True)
@@ -679,7 +683,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v4.0</span>
+    <span class="rv-version">v5.0</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
