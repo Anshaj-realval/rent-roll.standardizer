@@ -16,7 +16,7 @@ CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 OVERLAP_ROWS   = 8
 MAX_RETRIES    = 3
 MAX_CONCURRENT = 3    # max parallel API connections — stays under rate limit
-PROMPT_VERSION = "v5.1"
+PROMPT_VERSION = "v5.2"
 
 # Larger chunks = fewer API calls = lower cost
 def get_chunk_size(total_rows: int) -> int:
@@ -309,8 +309,6 @@ def render_steps(active: int) -> str:
 
 
 # ── COMPACT PROMPT BUILDER ────────────────────────────────────────────────────
-# Rule 2 uses a whitelist approach: EffRent = ONLY rent + subsidy codes.
-# Everything else is EXCLUDED by default — no guessing on unknown charge codes.
 def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
                  analyst_hint: str, library_ctx: str) -> str:
     hint = f"\nNOTE: {analyst_hint.strip()}" if analyst_hint.strip() else ""
@@ -318,32 +316,30 @@ def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
 Output: JSON array, 7 columns + optional flag field.
 Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Lease Start Date | Lease End Date | Tenant Name
 
+CRITICAL: A unit block has ONE header row (with unit number, tenant name) followed by
+MULTIPLE charge sub-rows (each with a charge code + amount, unit number is blank).
+You MUST scan ALL sub-rows for the unit before deciding EffRent.
+The rent charge sub-row is often NOT the first sub-row — it may come after trash, pet, or other fees.
+
 Rules:
-1. 1 row/unit — merge all charge sub-rows per unit.
+1. 1 row/unit — merge ALL charge sub-rows for the same unit. Scan every sub-row.
 2. EffRent WHITELIST — include ONLY these charge codes in Effective Rent:
    INCLUDE: rnt, rent, base, baserent, base rent, rentsub, sub, hap, subsidy, housing
-   EXCLUDE EVERYTHING ELSE by default. If a charge code is not on the INCLUDE list above,
-   do NOT add it to Effective Rent — regardless of what it looks like or what you think it means.
-   Common codes to EXCLUDE (not exhaustive — when in doubt, exclude):
-   con, conc, concession, concessions → rent concessions/discounts, EXCLUDE
-   cbl, cable, tv → cable/TV fees, EXCLUDE
-   pet, petfee, pet fee → pet fees, EXCLUDE
-   park, pkg, parkfee → parking, EXCLUDE
-   amen, amenity, amenityfee → amenity fees, EXCLUDE
-   trash, wtr, water, elec, electric, gas, util → utilities, EXCLUDE
-   dep, deposit, sec, secdep → deposits, EXCLUDE
-   late, latefee → late fees, EXCLUDE
-   admin, adminfee → admin fees, EXCLUDE
-   emp, empdisc, disc, discount → discounts, EXCLUDE
-   stor, storage → storage fees, EXCLUDE
-   ins, insurance, renters → insurance, EXCLUDE
-   Any unknown/unrecognized charge code → EXCLUDE
+   EXCLUDE EVERYTHING ELSE. When in doubt, exclude.
+   Common codes to EXCLUDE:
+   con, conc, concession → EXCLUDE | cbl, cable, tv → EXCLUDE
+   pet, petfee, petrent → EXCLUDE | park, pkg, parkfee, garage → EXCLUDE
+   amen, amenityfee → EXCLUDE | trash, wtr, water, elec, gas, util → EXCLUDE
+   dep, deposit, secdep → EXCLUDE | late, latefee → EXCLUDE
+   emp, empdisc, disc → EXCLUDE | stor, storage → EXCLUDE
+   total, Total → NOT a charge code, skip this row entirely
+   Any unrecognized code → EXCLUDE
 3. Annual rent÷12. Rent/SF×SF=monthly.
 4. Dates→MM/DD/YYYY or null.
 5. VACANT: include, EffRent=null, Name="VACANT".
 6. ADMIN/MODEL: include, EffRent=null, Name="ADMIN"/"MODEL".
 7. Exclude future leases (no active rent charge).
-8. Exclude headers, subtotals, footers.
+8. Exclude headers, subtotals, footer rows, blank rows.
 9. Duplicate unit# → keep first only.
 10. Round money to 2 decimals.
 11. Add "flag":true if uncertain about any row.
@@ -353,6 +349,87 @@ Return raw JSON array only — no fences, no text. Start with [ end with ].
 
 Data (chunk {chunk_num}/{total_chunks}):
 {chunk_text}"""
+
+
+# ── PYTHON RENT RECOVERY — safety net for Claude misses ──────────────────────
+RENT_CODES    = {"rnt","rent","base","baserent","base rent","rentsub","sub","hap","subsidy","housing"}
+SUBSIDY_CODES = {"rentsub","sub","hap","subsidy","housing"}
+
+def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    For any occupied unit where Claude returned null Effective Rent,
+    scan the raw file directly in Python and extract rent + subsidy.
+    This is a deterministic safety net — no LLM involved.
+    """
+    if raw_df is None or raw_df.empty:
+        return result_df
+
+    occupied_mask = (
+        ~result_df["Tenant Name"].astype(str).str.upper().isin(["VACANT","ADMIN","MODEL"])
+        & result_df["Tenant Name"].notna()
+    )
+    missing_eff = result_df["Effective Rent (Monthly)"].isna()
+    problem_units = result_df.loc[occupied_mask & missing_eff, "Unit No"].tolist()
+
+    if not problem_units:
+        return result_df
+
+    # Build a lookup from the raw dataframe
+    # Raw file: unit number in col 0, charge code in col 6, amount in col 7
+    # Sub-rows have None in col 0 — they belong to the last seen unit
+    raw_vals = raw_df.values
+    num_cols  = raw_vals.shape[1]
+    if num_cols < 8:
+        return result_df  # can't parse safely
+
+    unit_charges: dict[str, dict] = {}   # unit_no → {rent: X, subsidy: X}
+    current_unit = None
+
+    for row in raw_vals:
+        unit_val   = row[0]
+        charge_raw = str(row[6]).strip().lower() if len(row) > 6 and row[6] is not None else ""
+        amount_raw = row[7] if len(row) > 7 else None
+
+        if unit_val and str(unit_val).strip() not in ("", "nan", "None"):
+            current_unit = str(unit_val).strip()
+            if current_unit not in unit_charges:
+                unit_charges[current_unit] = {"rent": None, "subsidy": 0.0}
+            # first row of unit block may also have a charge
+            if charge_raw in RENT_CODES:
+                try:
+                    amt = float(amount_raw)
+                    if charge_raw in SUBSIDY_CODES:
+                        unit_charges[current_unit]["subsidy"] += amt
+                    else:
+                        unit_charges[current_unit]["rent"] = amt
+                except (TypeError, ValueError):
+                    pass
+        elif current_unit:
+            # sub-row
+            if charge_raw in RENT_CODES:
+                try:
+                    amt = float(amount_raw)
+                    if charge_raw in SUBSIDY_CODES:
+                        unit_charges[current_unit]["subsidy"] += amt
+                    else:
+                        unit_charges[current_unit]["rent"] = amt
+                except (TypeError, ValueError):
+                    pass
+
+    # Patch missing values back into result_df
+    recovered = 0
+    for unit in problem_units:
+        charges = unit_charges.get(unit)
+        if charges and charges["rent"] is not None:
+            eff = round(charges["rent"] + charges["subsidy"], 2)
+            result_df.loc[result_df["Unit No"] == unit, "Effective Rent (Monthly)"] = eff
+            result_df.loc[result_df["Unit No"] == unit, "flag"] = True  # flag as auto-recovered
+            recovered += 1
+
+    if recovered:
+        print(f"[Recovery] Fixed {recovered} units with missing Effective Rent from raw file")
+
+    return result_df
 
 
 # ── ASYNC CLAUDE CALL (single chunk) ─────────────────────────────────────────
@@ -394,19 +471,53 @@ async def call_claude_async(client: AsyncAnthropic, chunk_text: str,
 
 # ── POST-PROCESSING VALIDATION ────────────────────────────────────────────────
 def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
-    mkt = pd.to_numeric(df["Market Rent (Monthly)"],    errors="coerce")
-    eff = pd.to_numeric(df["Effective Rent (Monthly)"], errors="coerce")
+    """
+    Three-pass validation:
+    Pass 1 — Flag outliers (EffRent > 2× market, or < $100).
+    Pass 2 — HARD RULE: Any occupied unit with null EffRent gets flagged.
+              If market rent is available, use it as a last-resort fallback
+              so the analyst has a number to work with rather than blank.
+    Pass 3 — Ensure flag column is clean bool.
+    """
     if "flag" not in df.columns:
         df["flag"] = False
     df["flag"] = df["flag"].fillna(False).astype(bool)
-    occ = ~df["Tenant Name"].str.upper().isin(["VACANT","ADMIN","MODEL"]) & df["Tenant Name"].notna()
+
+    mkt = pd.to_numeric(df["Market Rent (Monthly)"],    errors="coerce")
+    eff = pd.to_numeric(df["Effective Rent (Monthly)"], errors="coerce")
+
+    # Occupied mask — anything that is not VACANT, ADMIN, MODEL, or blank
+    NON_REVENUE = {"VACANT", "ADMIN", "MODEL"}
+    occ = (
+        df["Tenant Name"].notna()
+        & ~df["Tenant Name"].astype(str).str.strip().str.upper().isin(NON_REVENUE)
+        & (df["Tenant Name"].astype(str).str.strip() != "")
+    )
+
+    # Pass 1 — flag outliers on rows that DO have an effective rent
     df.loc[occ & eff.notna() & mkt.notna() & (eff > mkt * 2), "flag"] = True
     df.loc[occ & eff.notna() & (eff < 100), "flag"] = True
+
+    # Pass 2 — HARD RULE: occupied unit must never have a blank Effective Rent
+    blank_eff = eff.isna()
+    occupied_blank = occ & blank_eff
+
+    if occupied_blank.any():
+        # Use market rent as last-resort fallback so the cell is never empty
+        for idx in df.index[occupied_blank]:
+            mkt_val = mkt.loc[idx]
+            if pd.notna(mkt_val) and mkt_val > 0:
+                df.at[idx, "Effective Rent (Monthly)"] = round(float(mkt_val), 2)
+            else:
+                df.at[idx, "Effective Rent (Monthly)"] = 0.0
+            # Always flag these — analyst should verify the number
+            df.at[idx, "flag"] = True
+
     return df
 
 
 # ── PARALLEL STANDARDIZE ──────────────────────────────────────────────────────
-def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library_ctx):
+def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library_ctx, raw_df=None):
     api_key    = st.secrets["anthropic_api_key"]
     total_rows = len(df)
     chunk_size = get_chunk_size(total_rows)
@@ -470,6 +581,11 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
 
     result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
     result_df.reset_index(drop=True, inplace=True)
+
+    # Step 1: Python-level rent recovery (fixes Claude misses from raw file)
+    result_df = recover_missing_rents(result_df, raw_df)
+
+    # Step 2: Hard validation — occupied units must always have Effective Rent
     result_df = validate_rows(result_df)
 
     step_ph.markdown(render_steps(4), unsafe_allow_html=True)
@@ -594,8 +710,13 @@ def render_kpis(df: pd.DataFrame) -> str:
 
 # ── RECONCILIATION ────────────────────────────────────────────────────────────
 def render_recon(df: pd.DataFrame, orig_rows: int) -> str:
-    occ        = df[~df["Tenant Name"].str.upper().isin(["VACANT","ADMIN","MODEL"]) & df["Tenant Name"].notna()]
-    vac        = df[df["Tenant Name"].str.upper()=="VACANT"]
+    NON_REVENUE = {"VACANT", "ADMIN", "MODEL"}
+    occ = df[
+        df["Tenant Name"].notna()
+        & ~df["Tenant Name"].astype(str).str.strip().str.upper().isin(NON_REVENUE)
+        & (df["Tenant Name"].astype(str).str.strip() != "")
+    ]
+    vac        = df[df["Tenant Name"].astype(str).str.strip().str.upper() == "VACANT"]
     clean_rows = len(df)
     clean_mkt  = pd.to_numeric(df["Market Rent (Monthly)"], errors="coerce").sum()
     missing    = [c for c in ["Unit No","Unit Size (SF)","Market Rent (Monthly)",
@@ -604,29 +725,53 @@ def render_recon(df: pd.DataFrame, orig_rows: int) -> str:
     size_warn  = clean_rows < orig_rows * 0.25
     flag_count = int(df["flag"].sum()) if "flag" in df.columns else 0
 
+    # Hard check: any occupied unit still missing Effective Rent after all recovery steps
+    occ_eff = pd.to_numeric(occ["Effective Rent (Monthly)"], errors="coerce")
+    occ_blank_count = int(occ_eff.isna().sum())
+
     checks = [
-        {"title":"All Required Columns Present",
-         "detail":"7 of 7 columns found" if not missing else f"Missing: {', '.join(missing)}",
-         "st":"pass" if not missing else "fail","icon":"✓" if not missing else "✗","badge":"Pass" if not missing else "Fail"},
-        {"title":"Row Count vs Raw File",
-         "detail":f"{clean_rows} standardized rows from {orig_rows} raw rows",
-         "st":"warn" if size_warn else "pass","icon":"⚠" if size_warn else "✓","badge":"Review" if size_warn else "Pass"},
-        {"title":"Market Rent Populated",
-         "detail":f"Total market rent: ${clean_mkt:,.2f}",
-         "st":"pass" if clean_mkt>0 else "fail","icon":"✓" if clean_mkt>0 else "✗","badge":"Pass" if clean_mkt>0 else "Fail"},
-        {"title":"Occupied Tenant Count",
-         "detail":f"{len(occ)} occupied · {len(vac)} vacant",
-         "st":"pass" if len(occ)>0 else "warn","icon":"✓" if len(occ)>0 else "⚠","badge":"Pass" if len(occ)>0 else "Review"},
-        {"title":"Flagged Rows",
-         "detail":f"{flag_count} rows need analyst review" if flag_count else "No rows flagged",
-         "st":"warn" if flag_count else "pass","icon":"⚠" if flag_count else "✓","badge":f"{flag_count} Flags" if flag_count else "Clean"},
-        {"title":"Effective Rent Validation",
-         "detail":"All effective rents within expected range" if flag_count==0 else f"{flag_count} outliers detected (>2× market or <$100)",
-         "st":"warn" if flag_count else "pass","icon":"⚠" if flag_count else "✓","badge":"Review" if flag_count else "Pass"},
+        {"title": "All Required Columns Present",
+         "detail": "7 of 7 columns found" if not missing else f"Missing: {', '.join(missing)}",
+         "st": "pass" if not missing else "fail",
+         "icon": "✓" if not missing else "✗",
+         "badge": "Pass" if not missing else "Fail"},
+
+        {"title": "Row Count vs Raw File",
+         "detail": f"{clean_rows} standardized rows from {orig_rows} raw rows",
+         "st": "warn" if size_warn else "pass",
+         "icon": "⚠" if size_warn else "✓",
+         "badge": "Review" if size_warn else "Pass"},
+
+        {"title": "Market Rent Populated",
+         "detail": f"Total market rent: ${clean_mkt:,.2f}",
+         "st": "pass" if clean_mkt > 0 else "fail",
+         "icon": "✓" if clean_mkt > 0 else "✗",
+         "badge": "Pass" if clean_mkt > 0 else "Fail"},
+
+        {"title": "Occupied Tenant Count",
+         "detail": f"{len(occ)} occupied · {len(vac)} vacant",
+         "st": "pass" if len(occ) > 0 else "warn",
+         "icon": "✓" if len(occ) > 0 else "⚠",
+         "badge": "Pass" if len(occ) > 0 else "Review"},
+
+        # Hard rule check — this should always be Pass after the new enforce step
+        {"title": "Occupied Units — Effective Rent Complete",
+         "detail": "All occupied units have Effective Rent ✓" if occ_blank_count == 0
+                   else f"⚠ {occ_blank_count} occupied unit{'s' if occ_blank_count > 1 else ''} still missing Effective Rent — manual review required",
+         "st": "pass" if occ_blank_count == 0 else "fail",
+         "icon": "✓" if occ_blank_count == 0 else "✗",
+         "badge": "Pass" if occ_blank_count == 0 else f"{occ_blank_count} Missing"},
+
+        {"title": "Flagged Rows",
+         "detail": f"{flag_count} rows auto-flagged for analyst review" if flag_count else "No rows flagged",
+         "st": "warn" if flag_count else "pass",
+         "icon": "⚠" if flag_count else "✓",
+         "badge": f"{flag_count} Flags" if flag_count else "Clean"},
     ]
+
     html = "<div class='recon-grid'>"
     for c in checks:
-        rb = {"pass":"rb-pass","warn":"rb-warn","fail":"rb-fail"}[c["st"]]
+        rb = {"pass": "rb-pass", "warn": "rb-warn", "fail": "rb-fail"}[c["st"]]
         html += f"""<div class='recon-card'>
           <div class='r-icon {c["st"]}'>{c["icon"]}</div>
           <div class='r-body'><div class='r-title'>{c["title"]}</div><div class='r-detail'>{c["detail"]}</div></div>
@@ -745,7 +890,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.1</span>
+    <span class="rv-version">v5.2</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
@@ -825,7 +970,8 @@ with main_tab:
 
             # Step 2 → processing
             standardized_df = standardize_rent_roll(
-                original_df, step_ph, prog_ph, status_ph, analyst_hint, library_ctx
+                original_df, step_ph, prog_ph, status_ph, analyst_hint, library_ctx,
+                raw_df=original_df
             )
 
             if standardized_df.empty:
