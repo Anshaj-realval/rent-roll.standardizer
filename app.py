@@ -16,7 +16,7 @@ CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 OVERLAP_ROWS   = 8
 MAX_RETRIES    = 3
 MAX_CONCURRENT = 3    # max parallel API connections — stays under rate limit
-PROMPT_VERSION = "v5.3"
+PROMPT_VERSION = "v5.4"
 
 # Larger chunks = fewer API calls = lower cost
 def get_chunk_size(total_rows: int) -> int:
@@ -262,57 +262,62 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
 
 
 # ── COLUMN LABELLER ───────────────────────────────────────────────────────────
-def label_raw_df(df: pd.DataFrame) -> pd.DataFrame:
+def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """
-    Detects the real header rows (which Yardi/MRI split across 2 rows)
-    and assigns proper column names so Claude always sees named columns
-    instead of anonymous 0,1,2...N indices.
-    This is the primary fix for Claude confusing Market Rent (col5 header row)
-    with Effective Rent (col7 on charge sub-rows).
+    Detects the real header rows (Yardi/MRI split headers across 2 rows),
+    assigns clean column names, and returns a column position map.
+
+    Returns: (labelled_df, col_map)
+      col_map keys: 'unit', 'charge_code', 'charge_amount', 'market_rent',
+                    'deposit', 'move_in', 'lease_exp', 'move_out'
+      All values are integer column positions in the labelled df.
     """
     vals = df.values
     header_row = None
 
-    # Find the row that contains 'unit' and 'charge' or 'rent'
     for i, row in enumerate(vals[:15]):
-        texts = [str(v).lower().strip() for v in row if v is not None]
+        texts = [str(v).lower().strip() for v in row if v is not None and str(v).strip().lower() != 'nan']
         if any("unit" in t for t in texts) and any(t in ("charge","rent","market") for t in texts):
             header_row = i
             break
 
     if header_row is None:
-        # Can't find header — return as-is with string column names
         df.columns = [str(c) for c in df.columns]
-        return df
+        return df, {}
 
-    # Combine two-row header (common in Yardi exports)
-    row_a = [str(v).strip() if v is not None else "" for v in vals[header_row]]
-    row_b = [str(v).strip() if v is not None else "" for v in vals[header_row + 1]] \
+    def clean(v):
+        """Strip cell value, return '' for None/nan."""
+        s = str(v).strip() if v is not None else ""
+        return "" if s.lower() == "nan" else s
+
+    row_a = [clean(v) for v in vals[header_row]]
+    row_b = [clean(v) for v in vals[header_row + 1]] \
             if header_row + 1 < len(vals) else [""] * len(row_a)
 
+    # Combine two header rows, ignoring empty/nan parts
     combined = []
     for a, b in zip(row_a, row_b):
         parts = " ".join(p for p in [a, b] if p).strip()
         combined.append(parts if parts else f"col_{len(combined)}")
 
-    # Normalise to clean names
+    # Canonical name map — keys must match combined (after lowercasing)
     name_map = {
-        "unit": "Unit No",
-        "unit type": "Unit Type",
-        "unit sq ft": "Sq Ft",
-        "sq ft": "Sq Ft",
-        "resident": "Resident ID",
-        "name": "Tenant Name",
-        "market rent": "Market Rent",      # ← explicit: this is MARKET rent
-        "charge code": "Charge Code",      # ← explicit: this is the CODE
-        "amount": "Charge Amount",         # ← explicit: this is the AMOUNT (eff rent when code=rent)
-        "resident deposit": "Res Deposit",
-        "other deposit": "Other Deposit",
-        "other deposits": "Other Deposit",
-        "move in": "Move In",
-        "lease expiration": "Lease Expiration",
-        "move out": "Move Out",
-        "balance": "Balance",
+        "unit":                "Unit No",
+        "unit type":           "Unit Type",
+        "unit sq ft":          "Sq Ft",
+        "sq ft":               "Sq Ft",
+        "resident":            "Resident ID",
+        "name":                "Tenant Name",
+        "market rent":         "Market Rent",
+        "charge code":         "Charge Code",
+        "amount":              "Charge Amount",   # ← THE rent amount column
+        "resident deposit":    "Res Deposit",
+        "other deposit":       "Other Deposit",
+        "other deposits":      "Other Deposit",
+        "move in":             "Move In",
+        "lease expiration":    "Lease Expiration",
+        "move out":            "Move Out",
+        "balance":             "Balance",
     }
 
     clean_cols = []
@@ -320,7 +325,6 @@ def label_raw_df(df: pd.DataFrame) -> pd.DataFrame:
     for raw in combined:
         key = raw.lower().strip()
         mapped = name_map.get(key, raw)
-        # De-duplicate
         if mapped in seen:
             seen[mapped] += 1
             mapped = f"{mapped}_{seen[mapped]}"
@@ -328,11 +332,23 @@ def label_raw_df(df: pd.DataFrame) -> pd.DataFrame:
             seen[mapped] = 0
         clean_cols.append(mapped)
 
-    # Drop header rows and re-index
+    # Build position map BEFORE dropping header rows
+    col_map = {}
+    for i, name in enumerate(clean_cols):
+        if name == "Unit No":           col_map["unit"]          = i
+        elif name == "Charge Code":     col_map["charge_code"]   = i
+        elif name == "Charge Amount":   col_map["charge_amount"] = i
+        elif name == "Market Rent":     col_map["market_rent"]   = i
+        elif name == "Res Deposit":     col_map["deposit"]       = i
+        elif name == "Move In":         col_map["move_in"]       = i
+        elif name == "Lease Expiration":col_map["lease_exp"]     = i
+        elif name == "Move Out":        col_map["move_out"]      = i
+
+    # Drop header rows, assign clean column names
     data_df = df.iloc[header_row + 2:].copy()
     data_df.columns = clean_cols[:data_df.shape[1]]
     data_df = data_df.reset_index(drop=True)
-    return data_df
+    return data_df, col_map
 
 
 def init_library():
@@ -383,24 +399,40 @@ def render_steps(active: int) -> str:
 
 # ── COMPACT PROMPT BUILDER ────────────────────────────────────────────────────
 def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
-                 analyst_hint: str, library_ctx: str) -> str:
+                 analyst_hint: str, library_ctx: str, col_map: dict = None) -> str:
     hint = f"\nNOTE: {analyst_hint.strip()}" if analyst_hint.strip() else ""
+
+    # Build a locked column instruction from the detected column map
+    # This is the definitive fix: Claude is told EXACTLY which named column to read
+    if col_map:
+        amt_col  = col_map.get("charge_amount", 7)
+        code_col = col_map.get("charge_code",   6)
+        mkt_col  = col_map.get("market_rent",   5)
+        dep_col  = col_map.get("deposit",        8)
+        col_lock = (
+            f"\nCOLUMN LOCK (detected from this file's headers — do not override):\n"
+            f"  Charge Amount column = '{['Charge Amount'] + [f'col position {amt_col}'][0:1][0]}' "
+            f"(position {amt_col}) — THIS is where Effective Rent comes from\n"
+            f"  Charge Code column   = position {code_col}\n"
+            f"  Market Rent column   = position {mkt_col} — NEVER use as Effective Rent\n"
+            f"  Deposit column       = position {dep_col} — NEVER use as Effective Rent\n"
+            f"  When Charge Code = 'rent', read Effective Rent from Charge Amount column ONLY.\n"
+            f"  The deposit column is always immediately to the RIGHT of Charge Amount. Do not confuse them."
+        )
+    else:
+        col_lock = (
+            "\nCOLUMN RULE: Effective Rent comes ONLY from the 'Charge Amount' column "
+            "where 'Charge Code' = rent. Never use Market Rent or any deposit column."
+        )
+
     return f"""Multifamily rent roll standardizer. ({PROMPT_VERSION})
 Output: JSON array, 9 columns + optional flag field.
 Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Move In Date | Lease Start Date | Lease End Date | Move Out Date | Tenant Name
 
-CRITICAL: A unit block has ONE header row (with unit number, tenant name) followed by
-MULTIPLE charge sub-rows (each with a charge code + amount, unit number is blank).
-You MUST scan ALL sub-rows for the unit before deciding EffRent.
-The rent charge sub-row is often NOT the first sub-row — it may come after trash, pet, or other fees.
-
-COLUMN NAMES (the data has been pre-labelled for you):
-- "Unit No" = unit identifier
-- "Market Rent" = the advertised/listed rent — DO NOT use this as Effective Rent
-- "Charge Code" = the charge type on each sub-row (rent, trash, petfee, etc.)
-- "Charge Amount" = the actual dollar amount for that charge — THIS is the Effective Rent when Charge Code = rent
-- Effective Rent ALWAYS comes from "Charge Amount" where "Charge Code" = rent (or subsidy code)
-- NEVER use the "Market Rent" column value as Effective Rent
+CRITICAL: A unit block has ONE header row (unit number, tenant name, market rent, first charge)
+followed by optional charge sub-rows (charge code + amount only, unit number blank).
+You MUST scan ALL rows for this unit before deciding EffRent.
+{col_lock}
 
 Rules:
 1. 1 row/unit — merge ALL charge sub-rows for the same unit. Scan every sub-row.
@@ -413,6 +445,7 @@ Rules:
    amen, amenityfee → EXCLUDE | trash, wtr, water, elec, gas, util → EXCLUDE
    dep, deposit, secdep → EXCLUDE | late, latefee → EXCLUDE
    emp, empdisc, disc → EXCLUDE | stor, storage → EXCLUDE
+   xmgmt, xonetime, x → management adjustments, EXCLUDE
    total, Total → NOT a charge code, skip this row entirely
    Any unrecognized code → EXCLUDE
 3. Annual rent÷12. Rent/SF×SF=monthly.
@@ -436,7 +469,8 @@ Data (chunk {chunk_num}/{total_chunks}):
 RENT_CODES    = {"rnt","rent","base","baserent","base rent","rentsub","sub","hap","subsidy","housing"}
 SUBSIDY_CODES = {"rentsub","sub","hap","subsidy","housing"}
 
-def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.DataFrame:
+def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame,
+                          col_map: dict = None) -> pd.DataFrame:
     """
     For any occupied unit where Claude returned null Effective Rent,
     scan the raw file directly in Python and extract rent + subsidy.
@@ -461,13 +495,18 @@ def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.D
     raw_vals  = raw_df.values
     num_cols  = raw_vals.shape[1]
     if num_cols < 8:
-        return result_df  # can't parse safely
+        return result_df
 
-    # Detect column indices — works for both labelled and unlabelled dataframes
-    cols = list(raw_df.columns)
-    unit_col   = cols.index("Unit No")        if "Unit No"        in cols else 0
-    code_col   = cols.index("Charge Code")    if "Charge Code"    in cols else 6
-    amount_col = cols.index("Charge Amount")  if "Charge Amount"  in cols else 7
+    # Use col_map if provided (most reliable), then named columns, then positional fallback
+    if col_map:
+        unit_col   = col_map.get("unit",          0)
+        code_col   = col_map.get("charge_code",   6)
+        amount_col = col_map.get("charge_amount", 7)
+    else:
+        cols = list(raw_df.columns)
+        unit_col   = cols.index("Unit No")       if "Unit No"       in cols else 0
+        code_col   = cols.index("Charge Code")   if "Charge Code"   in cols else 6
+        amount_col = cols.index("Charge Amount") if "Charge Amount" in cols else 7
 
     unit_charges: dict[str, dict] = {}
     current_unit = None
@@ -523,9 +562,10 @@ def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame) -> pd.D
 async def call_claude_async(client: AsyncAnthropic, chunk_text: str,
                              chunk_num: int, total_chunks: int,
                              analyst_hint: str, library_ctx: str,
-                             semaphore: asyncio.Semaphore) -> tuple[int, list]:
+                             semaphore: asyncio.Semaphore,
+                             col_map: dict = None) -> tuple[int, list]:
     """Returns (chunk_num, rows). Semaphore caps concurrent connections."""
-    prompt = build_prompt(chunk_text, chunk_num, total_chunks, analyst_hint, library_ctx)
+    prompt = build_prompt(chunk_text, chunk_num, total_chunks, analyst_hint, library_ctx, col_map)
     last_error = None
 
     async with semaphore:  # only MAX_CONCURRENT chunks run at once
@@ -607,9 +647,8 @@ def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
 def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library_ctx, raw_df=None):
     api_key    = st.secrets["anthropic_api_key"]
 
-    # Label columns before chunking — critical fix so Claude sees
-    # 'Market Rent' vs 'Charge Code' vs 'Charge Amount' instead of 0,1,2...N
-    labelled_df = label_raw_df(df.copy())
+    # Label columns before chunking — critical so Claude sees named columns
+    labelled_df, col_map = label_raw_df(df.copy())
     total_rows  = len(labelled_df)
     chunk_size  = get_chunk_size(total_rows)
 
@@ -637,7 +676,7 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
         sem = asyncio.Semaphore(MAX_CONCURRENT)
         tasks = [
             call_claude_async(async_client, csv_text, chunk_num, num_chunks,
-                              analyst_hint, library_ctx, sem)
+                              analyst_hint, library_ctx, sem, col_map)
             for chunk_num, csv_text in chunks
         ]
         return await asyncio.gather(*tasks)
@@ -674,7 +713,7 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     result_df.reset_index(drop=True, inplace=True)
 
     # Step 1: Python-level rent recovery (fixes Claude misses from raw file)
-    result_df = recover_missing_rents(result_df, raw_df)
+    result_df = recover_missing_rents(result_df, raw_df, col_map)
 
     # Step 2: Hard validation — occupied units must always have Effective Rent
     result_df = validate_rows(result_df)
@@ -876,82 +915,85 @@ def extract_source_summary(raw_df: pd.DataFrame) -> dict | None:
     """
     Scans the raw dataframe for the summary block that most Yardi/MRI/AppFolio
     exports include at the bottom (total units, occupied, vacant, market rent, etc.)
+    Also extracts the charge code breakdown table.
     Returns a dict of extracted values, or None if no summary found.
     """
     if raw_df is None or raw_df.empty:
         return None
 
     summary = {}
-    vals = raw_df.values
+    vals    = raw_df.values
 
-    # Keywords we search for in the first column (case-insensitive)
-    OCCUPIED_KW  = {"occupied units", "occupied"}
-    VACANT_KW    = {"total vacant units", "vacant units", "vacant"}
-    NONREV_KW    = {"total non rev units", "non rev units", "non-revenue", "admin/model", "model/admin"}
-    TOTALS_KW    = {"totals:", "totals", "grand total", "total"}
-    SUMMARY_KW   = {"summary groups", "summary group", "summary"}
-    CHARGECODE_KW= {"summary of charges", "charge code"}
+    OCCUPIED_KW   = {"occupied units", "occupied"}
+    VACANT_KW     = {"total vacant units", "vacant units", "vacant"}
+    NONREV_KW     = {"total non rev units", "non rev units", "non-revenue", "admin/model", "model/admin"}
+    TOTALS_KW     = {"totals:", "totals", "grand total", "total"}
+    CHARGECODE_KW = {"summary of charges", "charge code", "summary of charges by charge code"}
 
     in_chargecode_section = False
     charge_codes: dict[str, float] = {}
 
+    def safe_float(v):
+        try:
+            return float(str(v).replace(",","").replace("(","- ").replace(")","").strip())
+        except: return None
+
+    def safe_int(v):
+        try:
+            return int(float(str(v).replace(",","").strip()))
+        except: return None
+
     for row in vals:
+        # Pad short rows
+        row = list(row) + [None] * max(0, 14 - len(row))
         c0 = str(row[0]).strip().lower() if row[0] is not None else ""
 
-        # Detect charge code section
+        # Skip pure parenthetical / label rows
+        if c0.startswith("(") or c0 in ("", "nan", "charge code"):
+            continue
+
+        # Detect charge code section start
         if any(kw in c0 for kw in CHARGECODE_KW):
             in_chargecode_section = True
             continue
 
         if in_chargecode_section:
-            # charge code rows: col0=code, col3=amount
             code = c0
-            if code in ("total", "", "charge code", "nan"):
-                if code == "total":
-                    in_chargecode_section = False
+            if code == "total":
+                in_chargecode_section = False
                 continue
-            try:
-                amt_raw = row[3] if len(row) > 3 else None
-                if amt_raw is not None:
-                    amt = float(str(amt_raw).replace(",", "").replace("(", "-").replace(")", ""))
-                    charge_codes[code] = amt
-            except (ValueError, TypeError):
-                pass
+            if code in ("", "nan"):
+                continue
+            # Amount is in col3 for Yardi charge code tables
+            amt = safe_float(row[3])
+            if amt is not None:
+                charge_codes[code] = amt
             continue
 
-        # Occupied units row
+        # ── Summary group rows ──
         if any(kw == c0 for kw in OCCUPIED_KW):
-            try:
-                summary["src_occupied_units"]  = int(float(str(row[10]).replace(",",""))) if len(row) > 10 and row[10] else None
-                summary["src_occupied_mkt"]    = float(str(row[6]).replace(",",""))       if len(row) > 6  and row[6]  else None
-            except (ValueError, TypeError): pass
+            summary["src_occupied_units"] = safe_int(row[10])
+            v = safe_float(row[6])
+            if v: summary["src_occupied_mkt"] = v
 
-        # Vacant units row
         elif any(kw == c0 for kw in VACANT_KW):
-            try:
-                summary["src_vacant_units"]    = int(float(str(row[10]).replace(",",""))) if len(row) > 10 and row[10] else None
-                summary["src_vacant_mkt"]      = float(str(row[6]).replace(",",""))       if len(row) > 6  and row[6]  else None
-            except (ValueError, TypeError): pass
+            summary["src_vacant_units"] = safe_int(row[10])
 
-        # Non-rev units row
         elif any(kw == c0 for kw in NONREV_KW):
-            try:
-                summary["src_nonrev_units"]    = int(float(str(row[10]).replace(",",""))) if len(row) > 10 and row[10] else None
-                summary["src_nonrev_mkt"]      = float(str(row[6]).replace(",",""))       if len(row) > 6  and row[6]  else None
-            except (ValueError, TypeError): pass
+            summary["src_nonrev_units"] = safe_int(row[10])
 
-        # Totals row
-        elif any(kw == c0 for kw in TOTALS_KW) and not any(kw in c0 for kw in CHARGECODE_KW):
-            try:
-                summary["src_total_units"]     = int(float(str(row[10]).replace(",",""))) if len(row) > 10 and row[10] else None
-                summary["src_total_mkt"]       = float(str(row[6]).replace(",",""))       if len(row) > 6  and row[6]  else None
-                summary["src_occ_pct"]         = float(str(row[11]).replace(",",""))      if len(row) > 11 and row[11] else None
-                summary["src_lease_charges"]   = float(str(row[7]).replace(",",""))       if len(row) > 7  and row[7]  else None
-            except (ValueError, TypeError): pass
+        elif any(kw == c0 for kw in TOTALS_KW):
+            summary["src_total_units"]   = safe_int(row[10])
+            v = safe_float(row[6]);  
+            if v: summary["src_total_mkt"] = v
+            v = safe_float(row[11])
+            if v: summary["src_occ_pct"] = v
+            v = safe_float(row[7])
+            if v: summary["src_lease_charges"] = v
 
     if charge_codes:
         summary["src_charge_codes"] = charge_codes
-        # Sum of rent-family codes = source effective rent total
+        # src_rent_total = sum of ONLY the rent-family codes the source counted
         rent_total = sum(v for k, v in charge_codes.items() if k in RENT_CODES)
         if rent_total:
             summary["src_rent_total"] = rent_total
@@ -1347,7 +1389,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.3</span>
+    <span class="rv-version">v5.4</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
