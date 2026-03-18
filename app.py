@@ -16,7 +16,7 @@ CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 OVERLAP_ROWS   = 5            # reduced from 8 — saves ~10% tokens per file
 MAX_RETRIES    = 4
 MAX_CONCURRENT = 3            # back to 3 — with longer backoff this is safe
-PROMPT_VERSION = "v5.6"
+PROMPT_VERSION = "v5.7"
 
 # Chunk sizing — smaller = more parallelism + less output truncation risk
 def get_chunk_size(total_rows: int) -> int:
@@ -262,64 +262,86 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
 
 
 # ── COLUMN LABELLER ───────────────────────────────────────────────────────────
+def detect_format(combined_headers: list[str], is_split_header: bool) -> str:
+    """
+    Identifies the software/export format from the column header names.
+    Returns one of: 'yardi', 'appfolio', 'vesper', 'unknown'
+
+    Yardi   — split two-row header, Amount col, short charge codes (rent/trash/petfee)
+    AppFolio— single-row header, Scheduled Charges + Deposit Held, full-text codes
+    Vesper  — AppFolio variant, Budgeted Rent instead of Market Rent
+    """
+    h = " ".join(combined_headers).lower()
+    if is_split_header:
+        # Yardi always has a split header
+        return "yardi"
+    # Single-row header — distinguish AppFolio from Vesper
+    if "budgeted rent" in h:
+        return "vesper"
+    if "scheduled charges" in h or "bldg-unit" in h:
+        return "appfolio"
+    # Fallback: if Amount column present, probably Yardi-like
+    if "amount" in combined_headers:
+        return "yardi"
+    return "unknown"
+
+
 def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     """
-    Detects the real header rows (Yardi/MRI split headers across 2 rows),
-    assigns clean column names, and returns a column position map.
+    Auto-detects the rent roll software format, assigns clean column names,
+    and returns a column position map with the detected format name.
 
     Returns: (labelled_df, col_map)
-      col_map keys: 'unit', 'charge_code', 'charge_amount', 'market_rent',
-                    'deposit', 'move_in', 'lease_exp', 'move_out'
-      All values are integer column positions in the labelled df.
+    col_map includes key 'fmt' = one of 'yardi' | 'appfolio' | 'vesper' | 'unknown'
     """
     vals = df.values
     header_row = None
 
     for i, row in enumerate(vals[:15]):
         texts = [str(v).lower().strip() for v in row if v is not None and str(v).strip().lower() != 'nan']
-        # Use substring matching — headers may be 'Charge Code', 'Market Rent', 'Bldg-Unit' etc.
         has_unit   = any("unit" in t or "bldg" in t for t in texts)
-        has_charge = any(kw in t for t in texts for kw in ("charge", "rent", "market", "amount", "scheduled"))
+        has_charge = any(kw in t for t in texts for kw in ("charge", "rent", "market", "amount", "scheduled", "budgeted"))
         if has_unit and has_charge:
             header_row = i
             break
 
     if header_row is None:
         df.columns = [str(c) for c in df.columns]
-        return df, {}
+        return df, {"fmt": "unknown"}
 
     def clean(v):
-        """Strip cell value, return '' for None/nan."""
         s = str(v).strip() if v is not None else ""
         return "" if s.lower() == "nan" else s
 
     row_a = [clean(v) for v in vals[header_row]]
 
-    # Only use row_b if it looks like a real header continuation (mostly short words,
-    # not a section label like 'Property: X' or 'Unit Type: Y')
+    # Determine if row_b is a real header continuation or a section label
     row_b_raw = [clean(v) for v in vals[header_row + 1]] \
                 if header_row + 1 < len(vals) else [""] * len(row_a)
     non_empty_b = [v for v in row_b_raw if v]
     is_real_continuation = (
-        len(non_empty_b) >= 2  # multiple header fragments in row B
-        and not any(":" in v or len(v) > 25 for v in non_empty_b)  # not a label like 'Property: X'
+        len(non_empty_b) >= 2
+        and not any(":" in v or len(v) > 25 for v in non_empty_b)
     )
     row_b = row_b_raw if is_real_continuation else [""] * len(row_a)
 
-    # Combine two header rows, ignoring empty/nan parts
+    # Combine header rows
     combined = []
     for a, b in zip(row_a, row_b):
         parts = " ".join(p for p in [a, b] if p).strip()
         combined.append(parts if parts else f"col_{len(combined)}")
 
-    # Canonical name map — keys must match combined (after lowercasing)
+    # Detect format BEFORE mapping names
+    fmt = detect_format(combined, is_real_continuation)
+
+    # ── Universal canonical name map ──
     name_map = {
-        # Yardi style (split two-row header)
+        # Yardi (split two-row header)
         "unit":                 "Unit No",
         "unit type":            "Unit Type",
         "unit sq ft":           "Sq Ft",
         "sq ft":                "Sq Ft",
-        "resident":             "Resident ID",
+        "resident":             "Tenant Name",
         "name":                 "Tenant Name",
         "market rent":          "Market Rent",
         "charge code":          "Charge Code",
@@ -331,7 +353,7 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "lease expiration":     "Lease Expiration",
         "move out":             "Move Out",
         "balance":              "Balance",
-        # AppFolio / Crystal Gardens / Park Vista style (single-row header)
+        # AppFolio (single-row header)
         "bldg-unit":            "Unit No",
         "sqft":                 "Sq Ft",
         "unit status":          "Unit Status",
@@ -340,12 +362,11 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "expected move-out":    "Move Out",
         "ledger":               "Ledger",
         "actual charges":       "Actual Charges",
-        "scheduled charges":    "Charge Amount",   # ← eff rent in AppFolio format
+        "scheduled charges":    "Charge Amount",
         "deposit held":         "Res Deposit",
         "move-in":              "Move In",
-        # Sunbelt / Vesper style variants
-        "budgeted rent":        "Market Rent",      # ← Sunbelt uses Budgeted Rent
-        "resident":             "Tenant Name",      # ← Sunbelt has Resident as tenant name col
+        # Vesper/Sunbelt variant
+        "budgeted rent":        "Market Rent",
     }
 
     clean_cols = []
@@ -360,26 +381,27 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             seen[mapped] = 0
         clean_cols.append(mapped)
 
-    # Build position map BEFORE dropping header rows
-    col_map = {}
+    # Build position map
+    col_map = {"fmt": fmt}
     for i, name in enumerate(clean_cols):
-        if name == "Unit No":           col_map["unit"]          = i
-        elif name == "Charge Code":     col_map["charge_code"]   = i
-        elif name == "Charge Amount":   col_map["charge_amount"] = i
-        elif name == "Market Rent":     col_map["market_rent"]   = i
-        elif name == "Res Deposit":     col_map["deposit"]       = i
+        if name == "Unit No":            col_map["unit"]          = i
+        elif name == "Charge Code":      col_map["charge_code"]   = i
+        elif name == "Charge Amount":    col_map["charge_amount"] = i
+        elif name == "Market Rent":      col_map["market_rent"]   = i
+        elif name == "Res Deposit":      col_map["deposit"]       = i
         elif name == "Move In":          col_map["move_in"]       = i
         elif name in ("Lease Expiration", "Lease Start"): col_map["lease_exp"] = i
         elif name == "Move Out":         col_map["move_out"]      = i
         elif name == "Unit Status":      col_map["unit_status"]   = i
+        elif name == "Tenant Name":      col_map["tenant"]        = i
 
-    # Skip 2 rows for split-header formats (Yardi), 1 row for single-header (AppFolio)
+    # Skip 2 rows for Yardi split-header, 1 row for single-header formats
     rows_to_skip = 2 if is_real_continuation else 1
     data_df = df.iloc[header_row + rows_to_skip:].copy()
     data_df.columns = clean_cols[:data_df.shape[1]]
     data_df = data_df.reset_index(drop=True)
 
-    # Drop entirely-empty trailing columns — reduces token waste on wide files (e.g. 52-col)
+    # Drop entirely-empty trailing columns (reduces tokens on 52-col files)
     data_df = data_df.dropna(axis=1, how='all')
 
     return data_df, col_map
@@ -432,39 +454,63 @@ def render_steps(active: int) -> str:
 
 
 # ── COMPACT PROMPT BUILDER ────────────────────────────────────────────────────
+# Format-specific instructions keep Claude from guessing structure
+FORMAT_NOTES = {
+    "yardi": (
+        "FORMAT: Yardi export. Split two-row header. "
+        "Unit header row has: Unit No | Unit Type | Sq Ft | Resident ID | Tenant Name | Market Rent | Charge Code | Charge Amount | Res Deposit...\n"
+        "The rent charge code is a SHORT CODE on the unit header row itself (col6) or a sub-row.\n"
+        "Tenant Name is in the 'Tenant Name' column (col4). "
+        "Market Rent is col5. Charge Amount (col7) is the rent amount — NEVER col5 or col8."
+    ),
+    "appfolio": (
+        "FORMAT: AppFolio export. Single-row header. "
+        "Columns: Bldg-Unit | SQFT | Unit Status | Move-In | Lease Start | Lease End | Expected Move-Out | Market Rent | Ledger | Charge Code | Actual Charges | Scheduled Charges | Balance | Deposit Held\n"
+        "Effective Rent = Scheduled Charges (col11) where Charge Code = 'Rent' — NOT Deposit Held (col13).\n"
+        "Tenant Name comes from the Resident sub-row (Ledger = 'Resident'). "
+        "Vacant units have Unit Status containing 'Vacant' and Charge Code = '-'.\n"
+        "Section headers ('Unit Type:', 'Property:') are NOT units — skip them."
+    ),
+    "vesper": (
+        "FORMAT: Vesper/Sunbelt AppFolio export. Single-row header. "
+        "Columns: Bldg-Unit | Unit Type | SQFT | Unit Status | Budgeted Rent | Resident | Ledger | Charge Code | Scheduled Charges | Balance | Deposit Held | Move-In | Lease Start | Lease End | Expected Move-Out\n"
+        "Market Rent = Budgeted Rent (col4). Effective Rent = Scheduled Charges (col8) where Charge Code = 'Rent'.\n"
+        "Tenant Name = Resident column (col5). "
+        "Charge codes are full text: 'Rent', 'Pet Rent', 'Package Locker Fee', etc."
+    ),
+    "unknown": (
+        "FORMAT: Unknown. Use column names as labelled. "
+        "Effective Rent = Charge Amount column where Charge Code = rent/Rent. "
+        "Never use Market Rent or Deposit columns as Effective Rent."
+    ),
+}
+
 def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
                  analyst_hint: str, library_ctx: str, col_map: dict = None) -> str:
     hint = f"\nNOTE: {analyst_hint.strip()}" if analyst_hint.strip() else ""
 
-    # Build a locked column instruction from the detected column map
-    # This is the definitive fix: Claude is told EXACTLY which named column to read
+    fmt = (col_map or {}).get("fmt", "unknown")
+    format_note = FORMAT_NOTES.get(fmt, FORMAT_NOTES["unknown"])
+
+    # Locked column positions — tells Claude exactly where to look
     if col_map:
         amt_col  = col_map.get("charge_amount", 7)
         code_col = col_map.get("charge_code",   6)
         mkt_col  = col_map.get("market_rent",   5)
         dep_col  = col_map.get("deposit",        8)
         col_lock = (
-            f"\nCOLUMN LOCK (detected from this file's headers — do not override):\n"
-            f"  Charge Amount column = 'Charge Amount' (position {amt_col}) — THIS is where Effective Rent comes from\n"
-            f"  Charge Code column   = position {code_col}\n"
-            f"  Market Rent column   = position {mkt_col} — NEVER use as Effective Rent\n"
-            f"  Deposit column       = position {dep_col} — NEVER use as Effective Rent\n"
-            f"  When Charge Code = 'rent', read Effective Rent from Charge Amount column ONLY.\n"
-            f"  The deposit column is always immediately to the RIGHT of Charge Amount. Do not confuse them."
+            f"COLUMN LOCK — read Effective Rent from 'Charge Amount' (col {amt_col}) ONLY.\n"
+            f"  Charge Code = col {code_col} | Market Rent = col {mkt_col} (NEVER use as EffRent)"
+            f" | Deposit = col {dep_col} (NEVER use as EffRent)"
         )
     else:
-        col_lock = (
-            "\nCOLUMN RULE: Effective Rent comes ONLY from the 'Charge Amount' column "
-            "where 'Charge Code' = rent. Never use Market Rent or any deposit column."
-        )
+        col_lock = "COLUMN RULE: EffRent = 'Charge Amount' where Charge Code = rent. Never use Market Rent or Deposit."
 
     return f"""Multifamily rent roll standardizer. ({PROMPT_VERSION})
 Output: JSON array, 9 columns + optional flag field.
 Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Monthly) | Move In Date | Lease Start Date | Lease End Date | Move Out Date | Tenant Name
 
-CRITICAL: A unit block has ONE header row (unit number, tenant name, market rent, first charge)
-followed by optional charge sub-rows (charge code + amount only, unit number blank).
-You MUST scan ALL rows for this unit before deciding EffRent.
+{format_note}
 {col_lock}
 
 Rules:
@@ -735,7 +781,7 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     except RuntimeError as e:
         status_ph.empty()
         st.error(str(e))
-        return pd.DataFrame()
+        return pd.DataFrame(), col_map
 
     prog_ph.progress(1.0)
     status_ph.empty()
@@ -746,7 +792,7 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     all_rows = [row for _, chunk_rows in results_sorted for row in chunk_rows]
 
     if not all_rows:
-        return pd.DataFrame()
+        return pd.DataFrame(), col_map
 
     result_df = pd.DataFrame(all_rows)
     COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
@@ -768,7 +814,7 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     result_df = validate_rows(result_df)
 
     step_ph.markdown(render_steps(4), unsafe_allow_html=True)
-    return result_df
+    return result_df, col_map
 
 
 # ── COLOR-CODED TABLE ─────────────────────────────────────────────────────────
@@ -1507,7 +1553,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.6</span>
+    <span class="rv-version">v5.7</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
@@ -1589,7 +1635,7 @@ with main_tab:
             library_ctx = build_library_context()
 
             # Step 2 → processing
-            standardized_df = standardize_rent_roll(
+            standardized_df, col_map = standardize_rent_roll(
                 original_df, step_ph, prog_ph, status_ph, analyst_hint, library_ctx,
                 raw_df=original_df
             )
@@ -1600,8 +1646,20 @@ with main_tab:
 
             prog_ph.empty(); status_ph.empty()
 
-            # Extract source summary for verification
-            source_summary = extract_source_summary(original_df)
+            # Show detected format as a small badge
+            fmt = col_map.get("fmt", "unknown")
+            fmt_labels = {"yardi": "Yardi / MRI", "appfolio": "AppFolio", "vesper": "Vesper / Sunbelt", "unknown": "Unknown"}
+            fmt_colors = {"yardi": "#60a5fa", "appfolio": "#34d399", "vesper": "#f59e0b", "unknown": "#94a3b8"}
+            fmt_label = fmt_labels.get(fmt, fmt)
+            fmt_color = fmt_colors.get(fmt, "#94a3b8")
+            st.markdown(
+                f"<div style='margin-bottom:0.8rem;'>"
+                f"<span style='font-size:0.7rem;color:rgba(255,255,255,0.4);'>Format detected: </span>"
+                f"<span style='background:rgba(255,255,255,0.07);border:1px solid {fmt_color}40;"
+                f"border-radius:20px;padding:0.2rem 0.7rem;font-size:0.72rem;font-weight:600;"
+                f"color:{fmt_color};'>{fmt_label}</span></div>",
+                unsafe_allow_html=True
+            )
 
             # Auto-save to format library
             if broker_name.strip():
