@@ -16,7 +16,7 @@ CLAUDE_MODEL   = "claude-haiku-4-5-20251001"
 OVERLAP_ROWS   = 5            # reduced from 8 — saves ~10% tokens per file
 MAX_RETRIES    = 4
 MAX_CONCURRENT = 3            # back to 3 — with longer backoff this is safe
-PROMPT_VERSION = "v5.7"
+PROMPT_VERSION = "v5.8"
 
 # Chunk sizing — smaller = more parallelism + less output truncation risk
 def get_chunk_size(total_rows: int) -> int:
@@ -227,6 +227,9 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     """
     Reads all sheets, scores each by rent-roll signal words,
     returns (dataframe_of_best_sheet, sheet_name).
+    Uses data_only=True so formula cells (e.g. =A8) return cached values
+    instead of formula strings — critical for files like 3_RR where sub-rows
+    use =A8 references that resolve to the parent unit number.
     """
     xl      = pd.ExcelFile(io.BytesIO(file_bytes))
     sheets  = xl.sheet_names
@@ -238,12 +241,11 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     SIGNALS = ["unit","tenant","lease","rent","sqft","sq ft","market","charge",
                "resident","move","vacant","expir","deposit","occupan"]
     EXCLUDE = ["summary","totals","cover","index","toc","contents","chart","graph",
-               "pivot","dashboard","notes","readme"]
+               "pivot","dashboard","notes","readme","parameters","report param"]
 
     scores = {}
     for name in sheets:
         lname = name.lower()
-        # Hard-exclude obvious non-data sheets
         if any(x in lname for x in EXCLUDE):
             scores[name] = -1
             continue
@@ -251,13 +253,23 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
             sample = pd.read_excel(io.BytesIO(file_bytes), sheet_name=name, header=None, nrows=20)
             text   = " ".join(str(v).lower() for v in sample.values.flatten() if pd.notna(v))
             score  = sum(text.count(s) for s in SIGNALS)
-            score += sample.shape[0] * 0.5  # reward row count
+            score += sample.shape[0] * 0.5
             scores[name] = score
         except Exception:
             scores[name] = 0
 
     best = max(scores, key=scores.get)
     df   = pd.read_excel(io.BytesIO(file_bytes), sheet_name=best, header=None)
+
+    # Post-process: replace formula strings (=A8, =A9...) with NaN
+    # These are Excel references that openpyxl can't always resolve.
+    # Sub-rows that carry forward unit number via formulas should be treated as None.
+    import re
+    formula_mask = df.applymap(
+        lambda v: bool(re.match(r'^=', str(v))) if v is not None and str(v).startswith('=') else False
+    )
+    df = df.where(~formula_mask, other=None)
+
     return df, best
 
 
@@ -265,25 +277,56 @@ def detect_rent_roll_sheet(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
 def detect_format(combined_headers: list[str], is_split_header: bool) -> str:
     """
     Identifies the software/export format from the column header names.
-    Returns one of: 'yardi', 'appfolio', 'vesper', 'unknown'
-
-    Yardi   — split two-row header, Amount col, short charge codes (rent/trash/petfee)
-    AppFolio— single-row header, Scheduled Charges + Deposit Held, full-text codes
-    Vesper  — AppFolio variant, Budgeted Rent instead of Market Rent
+    Returns one of: 'yardi', 'appfolio', 'vesper', 'onsite', 'unknown'
     """
     h = " ".join(combined_headers).lower()
+    # OneSite/RealPage: has 'trans code' or 'lease rent' or 'market + addl'
+    if "trans code" in h or "lease rent" in h or "market + addl" in h:
+        return "onsite"
     if is_split_header:
-        # Yardi always has a split header
         return "yardi"
-    # Single-row header — distinguish AppFolio from Vesper
     if "budgeted rent" in h:
         return "vesper"
     if "scheduled charges" in h or "bldg-unit" in h:
         return "appfolio"
-    # Fallback: if Amount column present, probably Yardi-like
     if "amount" in combined_headers:
         return "yardi"
     return "unknown"
+
+
+def preprocess_onsite(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pre-processes OneSite/RealPage exports before label_raw_df runs.
+    Handles three OneSite-specific issues:
+      1. Repeating page headers (~every 68 rows) — detected by '\nUnit' in col1
+      2. Interleaved Pending/Applicant future-lease rows — col8='N/A' or col20='N/A'
+         with Pending/Applicant in the next column
+      3. Embedded newlines in column headers (cleaned in label_raw_df's clean())
+    """
+    vals = list(df.values)
+    keep = []
+    for row in vals:
+        # Strip repeating page-break header rows
+        c1 = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ''
+        if '\nUnit' in c1 or c1 == '\nUnit':
+            continue
+        # Strip section labels like 'details', 'Other\nCharges/ Credits'
+        c0 = str(row[0]).strip() if row[0] is not None else ''
+        if c0.lower() in ('details', 'other\ncharges/ credits', 'other charges/ credits'):
+            continue
+        # Strip Pending/Applicant interleaved rows (future leases)
+        # These have no real unit number — col1 is N/A
+        if c1 == 'N/A':
+            status_col = str(row[20]).strip() if len(row) > 20 and row[20] is not None else ''
+            if 'pending' in status_col.lower() or 'applicant' in status_col.lower():
+                continue
+        keep.append(row)
+
+    result = pd.DataFrame(keep, columns=df.columns)
+
+    # Drop blank rows (OneSite puts a blank row between every unit block)
+    result = result.dropna(how='all').reset_index(drop=True)
+    return result
 
 
 def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -315,13 +358,27 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
 
     row_a = [clean(v) for v in vals[header_row]]
 
-    # Determine if row_b is a real header continuation or a section label
+    # Determine if row_b is a real header continuation or a data/label row.
+    # Real continuation: short label fragments like "Sq Ft", "Rent", "Code", "Expiration".
+    # Data row / label: contains long strings, full dates (with colons+digits), or
+    # section labels like "Property: X".
+    # KEY FIX: datetime strings like "2025-07-18 00:00:00" contain colons but ARE data,
+    # not header labels. We check for colons ONLY in purely-alphabetic tokens.
     row_b_raw = [clean(v) for v in vals[header_row + 1]] \
                 if header_row + 1 < len(vals) else [""] * len(row_a)
     non_empty_b = [v for v in row_b_raw if v]
+
+    def _looks_like_header_fragment(v: str) -> bool:
+        """True if v could be a header word/phrase, not data."""
+        if len(v) > 25: return False                              # too long
+        if v.replace('.','').replace(',','').replace('-','').isdigit(): return False  # pure number
+        if any(c.isdigit() for c in v) and ':' in v: return False # datetime-like
+        if ':' in v and not any(c.isdigit() for c in v): return False  # label like "Property:"
+        return True
+
     is_real_continuation = (
         len(non_empty_b) >= 2
-        and not any(":" in v or len(v) > 25 for v in non_empty_b)
+        and all(_looks_like_header_fragment(v) for v in non_empty_b)
     )
     row_b = row_b_raw if is_real_continuation else [""] * len(row_a)
 
@@ -341,8 +398,8 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "unit type":            "Unit Type",
         "unit sq ft":           "Sq Ft",
         "sq ft":                "Sq Ft",
-        "resident":             "Tenant Name",
-        "name":                 "Tenant Name",
+        "resident":             "Resident ID",   # col3 = Resident ID, NOT tenant name
+        "name":                 "Tenant Name",   # col4 = actual Tenant Name
         "market rent":          "Market Rent",
         "charge code":          "Charge Code",
         "amount":               "Charge Amount",
@@ -367,13 +424,26 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
         "move-in":              "Move In",
         # Vesper/Sunbelt variant
         "budgeted rent":        "Market Rent",
+        # OneSite/RealPage format
+        "unit":                 "Unit No",        # '\nUnit' cleaned to 'Unit'
+        "floorplan":            "Unit Type",
+        "unit designation":     "Unit Designation",
+        "unit/lease status":    "Unit Status",
+        "name":                 "Tenant Name",
+        "move-in move-out":     "Move In",
+        "market + addl.":       "Market Rent",    # OneSite market rent column
+        "trans code":           "Charge Code",    # OneSite charge code column
+        "lease rent":           "Charge Amount",  # OneSite effective rent column
+        "total billing":        "Total Billing",
+        "dep on hand":          "Res Deposit",
     }
 
     clean_cols = []
     seen = {}
     for raw in combined:
-        key = raw.lower().strip()
-        mapped = name_map.get(key, raw)
+        # Strip embedded newlines (OneSite headers have \nUnit, Market\n+ Addl. etc.)
+        key = raw.replace('\n', ' ').lower().strip()
+        mapped = name_map.get(key, raw.replace('\n', ' '))
         if mapped in seen:
             seen[mapped] += 1
             mapped = f"{mapped}_{seen[mapped]}"
@@ -400,6 +470,10 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     data_df = df.iloc[header_row + rows_to_skip:].copy()
     data_df.columns = clean_cols[:data_df.shape[1]]
     data_df = data_df.reset_index(drop=True)
+
+    # For OneSite: strip repeating page headers, Pending rows, blank rows
+    if fmt == "onsite":
+        data_df = preprocess_onsite(data_df)
 
     # Drop entirely-empty trailing columns (reduces tokens on 52-col files)
     data_df = data_df.dropna(axis=1, how='all')
@@ -457,30 +531,47 @@ def render_steps(active: int) -> str:
 # Format-specific instructions keep Claude from guessing structure
 FORMAT_NOTES = {
     "yardi": (
-        "FORMAT: Yardi export. Split two-row header. "
-        "Unit header row has: Unit No | Unit Type | Sq Ft | Resident ID | Tenant Name | Market Rent | Charge Code | Charge Amount | Res Deposit...\n"
-        "The rent charge code is a SHORT CODE on the unit header row itself (col6) or a sub-row.\n"
-        "Tenant Name is in the 'Tenant Name' column (col4). "
-        "Market Rent is col5. Charge Amount (col7) is the rent amount — NEVER col5 or col8."
+        "FORMAT: Yardi export. Split two-row header.\n"
+        "Unit header row columns: Unit No | Unit Type | Sq Ft | Resident ID | Tenant Name | Market Rent | Charge Code | Charge Amount | Res Deposit | Other Deposit | Move In | Lease Expiration | Move Out | Balance\n"
+        "IMPORTANT: col3 = Resident ID (e.g. t9142369) — this is NOT the tenant name.\n"
+        "col4 = Tenant Name — use this as the tenant name.\n"
+        "col5 = Market Rent — NEVER use as Effective Rent.\n"
+        "col6 = Charge Code (rent, trash, petfee, amenity, conrent, rmrnt etc.)\n"
+        "col7 = Charge Amount — THIS is the Effective Rent when Charge Code is a rent code.\n"
+        "col8 = Res Deposit — NEVER use as Effective Rent.\n"
+        "Rent codes: rent, rnt, base, baserent, conrent, rmrnt, subsidy, rentsub, hap.\n"
+        "conrent = contracted rent (Fieldcrest-style) — IS the effective rent.\n"
+        "concourt = court credit (always negative) — include, nets against conrent.\n"
+        "rmrnt = property-prefixed rent code — IS the effective rent.\n"
+        "Subsidy-only units: EffRent = subsidy amount (do NOT fall back to Market Rent)."
     ),
     "appfolio": (
-        "FORMAT: AppFolio export. Single-row header. "
+        "FORMAT: AppFolio export. Single-row header.\n"
         "Columns: Bldg-Unit | SQFT | Unit Status | Move-In | Lease Start | Lease End | Expected Move-Out | Market Rent | Ledger | Charge Code | Actual Charges | Scheduled Charges | Balance | Deposit Held\n"
-        "Effective Rent = Scheduled Charges (col11) where Charge Code = 'Rent' — NOT Deposit Held (col13).\n"
-        "Tenant Name comes from the Resident sub-row (Ledger = 'Resident'). "
-        "Vacant units have Unit Status containing 'Vacant' and Charge Code = '-'.\n"
+        "Effective Rent = Scheduled Charges where Charge Code = 'Rent' — NOT Deposit Held.\n"
+        "Tenant Name comes from Resident column (Ledger = 'Resident' sub-row).\n"
+        "Vacant: Unit Status contains 'Vacant', Charge Code = '-'.\n"
         "Section headers ('Unit Type:', 'Property:') are NOT units — skip them."
     ),
     "vesper": (
-        "FORMAT: Vesper/Sunbelt AppFolio export. Single-row header. "
+        "FORMAT: Vesper/Sunbelt AppFolio export. Single-row header.\n"
         "Columns: Bldg-Unit | Unit Type | SQFT | Unit Status | Budgeted Rent | Resident | Ledger | Charge Code | Scheduled Charges | Balance | Deposit Held | Move-In | Lease Start | Lease End | Expected Move-Out\n"
-        "Market Rent = Budgeted Rent (col4). Effective Rent = Scheduled Charges (col8) where Charge Code = 'Rent'.\n"
-        "Tenant Name = Resident column (col5). "
-        "Charge codes are full text: 'Rent', 'Pet Rent', 'Package Locker Fee', etc."
+        "Market Rent = Budgeted Rent column. Effective Rent = Scheduled Charges where Charge Code = 'Rent'.\n"
+        "Tenant Name = Resident column. Charge codes are full text: 'Rent', 'Pet Rent' etc.\n"
+        "Employee Discount is a NEGATIVE charge — EXCLUDE it, do not net against rent."
+    ),
+    "onsite": (
+        "FORMAT: OneSite/RealPage export. Single-row header. Sparse columns (data every other column).\n"
+        "Key columns after label_raw_df: Unit No | Floorplan (Unit Type) | SQFT | Unit/Lease Status | Name (Tenant) | Lease Start | Lease End | Market Rent | Trans Code | Lease Rent | Total Billing | Dep On Hand\n"
+        "Market Rent = 'Market Rent' column (originally 'Market + Addl.').\n"
+        "Effective Rent = 'Charge Amount' column (originally 'Lease Rent') where Trans Code = 'RENT'.\n"
+        "ALL other Trans Codes are fees/adjustments — exclude: BUILDINGFACILITIES, GARAGE, VALETWASTE, PETRENT, STORAGE, MTOM, PARKING, CONC/SPECL, OFCRCRED, MODEL, REFERRAL.\n"
+        "Rows with status 'Pending renewal' or 'Applicant' are future leases — EXCLUDE.\n"
+        "Vacant units have status 'Vacant' and no Lease Rent value."
     ),
     "unknown": (
-        "FORMAT: Unknown. Use column names as labelled. "
-        "Effective Rent = Charge Amount column where Charge Code = rent/Rent. "
+        "FORMAT: Unknown. Use column names as labelled.\n"
+        "Effective Rent = Charge Amount column where Charge Code = rent/Rent.\n"
         "Never use Market Rent or Deposit columns as Effective Rent."
     ),
 }
@@ -516,38 +607,49 @@ Columns: Unit No | Unit Size (SF) | Market Rent (Monthly) | Effective Rent (Mont
 Rules:
 1. 1 row/unit — merge ALL charge sub-rows for the same unit. Scan every sub-row.
 2. EffRent WHITELIST — include ONLY these charge codes in Effective Rent:
-   SHORT CODES:  rnt, rent, base, baserent, rentsub, sub, hap, subsidy, housing
-   FULL TEXT:    Rent, Base Rent, Subsidy Rent, HAP, Housing Assistance
+   SHORT CODES (Yardi):  rnt, rent, base, baserent, rentsub, sub, hap, subsidy, housing
+   PROPERTY-PREFIXED:    conrent (contracted rent), rmrnt (property-prefixed rent) — these ARE rent
+   OFFSET CODES:         concourt (court credit, negative) — include, nets against conrent
+   FULL TEXT:            Rent, Base Rent, Subsidy Rent, HAP, Housing Assistance
    EXCLUDE EVERYTHING ELSE. When in doubt, exclude.
+   CRITICAL DISTINCTION: conrent ≠ con/conc. conrent IS rent. con/conc = concession → EXCLUDE.
    Common codes/descriptions to EXCLUDE:
-   pet, petfee, petrent, Pet Rent, Pet Fees, Monthly Pet Rent → EXCLUDE
-   park, pkg, parkfee, garage, Garage/Parking Premium, Optional Resident Parking → EXCLUDE
-   pest, Pest Control Fees Monthly → EXCLUDE
-   trash, Trash Fees → EXCLUDE
-   util, Utility Service Fee, Utility Administration Fees → EXCLUDE
+   pet, petfee, petrent, rmpet, PETRENT, Pet Rent, Pet Fees, Monthly Pet Rent → EXCLUDE
+   park, pkg, parkfee, rmpkg, rmpki, rmpke, rmpkx, GARAGE, PARKING, Garage/Parking → EXCLUDE
+   pest, pestfee, conpest, Pest Control Fees Monthly → EXCLUDE
+   trash, VALETWASTE, Trash Fees → EXCLUDE
+   util, conutil, Utility Service Fee, Utility Administration Fees → EXCLUDE
    water, wtr, Water/Sewer Reimbursement → EXCLUDE
    elec, electric, Electric - Reimbursement → EXCLUDE
    gas, Gas Reimbursement → EXCLUDE
    con, conc, concession, Monthly Concession, Month to Month Fees → EXCLUDE
+   conrisk, condamw, conpetrt, conmtmf, conutil, conpest → EXCLUDE (con-prefix fees)
+   conemp, emp, empdisc, emptaxed, OFCRCRED → EXCLUDE (employee/officer discounts)
    cbl, cable, tv → EXCLUDE
    dep, deposit, secdep, Security Deposit, Deposit Held → EXCLUDE
    late, latefee → EXCLUDE
-   emp, empdisc, emptaxed, disc → EXCLUDE
-   stor, storage → EXCLUDE
+   stor, storage, STORAGE → EXCLUDE
    xmgmt, xonetime → EXCLUDE
-   wd, insurmp, AmenTech, amentech, amenityfee → EXCLUDE
-   Package Locker Fee, Guarantor Waiver Fee, Credit Reporting Svc Fee, Credit Reporting Fee Auto → EXCLUDE
-   Lost Rent Model Unit → EXCLUDE (this is a negative adjustment, not real rent)
-   Charge Total, total, Total → NOT a charge — skip row entirely
+   wd, insurmp, rntins → EXCLUDE (insurance/damage fees)
+   amenity, amentech, AmenTech, amenityfee, rmamen, club → EXCLUDE
+   mtmfee, mtm, conmtmf, MTOM, MTM Fee → EXCLUDE (month-to-month fees)
+   short, Short Term Fee → EXCLUDE
+   rmcpk, rmcrp, rmcsx, rmptf → EXCLUDE (property-prefixed fees/adjustments)
+   Employee Discount → EXCLUDE (this is a negative charge — do NOT net it against rent)
+   Package Locker Fee, Guarantor Waiver Fee, Credit Reporting Svc Fee → EXCLUDE
+   BUILDINGFACILITIES, REFERRAL, MODEL, CONC/SPECL → EXCLUDE
+   Lost Rent Model Unit → EXCLUDE
+   Charge Total, Total → NOT a charge — skip row entirely
    Any unrecognized code or description → EXCLUDE
+   OUTPUT: Unit Type field = the unit type/floorplan from the raw file (col1 in Yardi, col1 in AppFolio).
 3. Annual rent÷12. Rent/SF×SF=monthly.
 4. Dates→MM/DD/YYYY or null.
 5. VACANT: any unit where Unit Status contains 'Vacant', or Tenant Name is blank/VACANT,
    or Charge Code is '-' or None with 0 scheduled charges → include, EffRent=null, Name="VACANT".
 6. ADMIN/MODEL/EXCLUDED: any unit with status 'Admin', 'Office', 'Model', 'Down Unit', 'Excluded'
    → include, EffRent=null, Name="ADMIN" or "MODEL" as appropriate.
-7. Exclude future leases (no active rent charge, future move-in date).
-8. Exclude section headers (Unit Type:, Property:), subtotals, footer rows, blank rows.
+7. Exclude future leases (no active rent charge, future move-in date, Pending/Applicant status).
+8. Exclude section headers (Unit Type:, Property:, details, Other Charges/Credits), subtotals, footer rows.
 9. Duplicate unit# → keep first only.
 10. Round money to 2 decimals.
 11. Add "flag":true if uncertain about any row.
@@ -560,9 +662,18 @@ Data (chunk {chunk_num}/{total_chunks}):
 
 
 # ── PYTHON RENT RECOVERY — safety net for Claude misses ──────────────────────
-RENT_CODES    = {"rnt","rent","base","baserent","base rent","rentsub","sub","hap","subsidy","housing",
-                 "subsidy rent"}  # AppFolio uses full text 'Subsidy Rent'
-SUBSIDY_CODES = {"rentsub","sub","hap","subsidy","housing","subsidy rent"}
+RENT_CODES    = {
+    # Standard Yardi short codes
+    "rnt", "rent", "base", "baserent", "base rent",
+    # Subsidy / HAP codes
+    "rentsub", "sub", "hap", "subsidy", "housing", "subsidy rent",
+    # Fieldcrest Walk consolidated-charge format
+    "conrent",     # contracted rent — IS the effective rent in con-prefix Yardi exports
+    "concourt",    # court/eviction credit — always negative, offsets conrent to $0
+    # The Jordan (4_RR) property-prefixed rent code
+    "rmrnt",       # rm-prefixed rent code used by this specific Yardi config
+}
+SUBSIDY_CODES = {"rentsub", "sub", "hap", "subsidy", "housing", "subsidy rent"}
 
 def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame,
                           col_map: dict = None) -> pd.DataFrame:
@@ -641,11 +752,21 @@ def recover_missing_rents(result_df: pd.DataFrame, raw_df: pd.DataFrame,
     recovered = 0
     for unit in problem_units:
         charges = unit_charges.get(unit)
-        if charges and charges["rent"] is not None:
-            eff = round(charges["rent"] + charges["subsidy"], 2)
-            result_df.loc[result_df["Unit No"] == unit, "Effective Rent (Monthly)"] = eff
-            result_df.loc[result_df["Unit No"] == unit, "flag"] = True  # flag as auto-recovered
-            recovered += 1
+        if not charges:
+            continue
+        rent_amt    = charges.get("rent")
+        subsidy_amt = charges.get("subsidy", 0.0)
+        if rent_amt is not None:
+            # Normal case: rent + any subsidy
+            eff = round(rent_amt + subsidy_amt, 2)
+        elif subsidy_amt and subsidy_amt > 0:
+            # Subsidy-only unit (e.g. Brandon Oaks 0417, 1209, 1405)
+            eff = round(subsidy_amt, 2)
+        else:
+            continue
+        result_df.loc[result_df["Unit No"] == unit, "Effective Rent (Monthly)"] = eff
+        result_df.loc[result_df["Unit No"] == unit, "flag"] = True
+        recovered += 1
 
     if recovered:
         print(f"[Recovery] Fixed {recovered} units with missing Effective Rent from raw file")
@@ -696,9 +817,11 @@ def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
     """
     Three-pass validation:
     Pass 1 — Flag outliers (EffRent > 2× market, or < $100).
-    Pass 2 — HARD RULE: Any occupied unit with null EffRent gets flagged.
-              If market rent is available, use it as a last-resort fallback
-              so the analyst has a number to work with rather than blank.
+    Pass 2 — HARD RULE: Any occupied unit with null EffRent gets flagged for review.
+              We NO LONGER auto-fill Market Rent as fallback — subsidy-only units and
+              special charge-code units (conrent, rmrnt etc.) legitimately have EffRent
+              that differs from Market Rent. Stamping Market Rent was causing wrong values.
+              Instead: flag as 0 so the analyst knows to review it.
     Pass 3 — Ensure flag column is clean bool.
     """
     if "flag" not in df.columns:
@@ -708,7 +831,6 @@ def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
     mkt = pd.to_numeric(df["Market Rent (Monthly)"],    errors="coerce")
     eff = pd.to_numeric(df["Effective Rent (Monthly)"], errors="coerce")
 
-    # Occupied mask — anything that is not VACANT, ADMIN, MODEL, or blank
     NON_REVENUE = {"VACANT", "ADMIN", "MODEL"}
     occ = (
         df["Tenant Name"].notna()
@@ -716,24 +838,18 @@ def validate_rows(df: pd.DataFrame) -> pd.DataFrame:
         & (df["Tenant Name"].astype(str).str.strip() != "")
     )
 
-    # Pass 1 — flag outliers on rows that DO have an effective rent
+    # Pass 1 — flag outliers
     df.loc[occ & eff.notna() & mkt.notna() & (eff > mkt * 2), "flag"] = True
     df.loc[occ & eff.notna() & (eff < 100), "flag"] = True
 
-    # Pass 2 — HARD RULE: occupied unit must never have a blank Effective Rent
-    blank_eff = eff.isna()
+    # Pass 2 — flag occupied units with blank EffRent but DO NOT auto-fill Market Rent
+    # recover_missing_rents() already tried Python-level recovery from raw file.
+    # If still null here, mark as flagged with 0 so analyst can see and fix.
+    blank_eff     = eff.isna()
     occupied_blank = occ & blank_eff
-
     if occupied_blank.any():
-        # Use market rent as last-resort fallback so the cell is never empty
-        for idx in df.index[occupied_blank]:
-            mkt_val = mkt.loc[idx]
-            if pd.notna(mkt_val) and mkt_val > 0:
-                df.at[idx, "Effective Rent (Monthly)"] = round(float(mkt_val), 2)
-            else:
-                df.at[idx, "Effective Rent (Monthly)"] = 0.0
-            # Always flag these — analyst should verify the number
-            df.at[idx, "flag"] = True
+        df.loc[occupied_blank, "Effective Rent (Monthly)"] = 0.0
+        df.loc[occupied_blank, "flag"] = True
 
     return df
 
@@ -795,7 +911,7 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
         return pd.DataFrame(), col_map
 
     result_df = pd.DataFrame(all_rows)
-    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+    COLS = ["Unit No","Unit Type","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
             "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
     for col in COLS:
         if col not in result_df.columns: result_df[col] = None
@@ -819,7 +935,7 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
 
 # ── COLOR-CODED TABLE ─────────────────────────────────────────────────────────
 def render_table(df: pd.DataFrame) -> str:
-    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+    COLS = ["Unit No","Unit Type","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
             "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
     hdr  = "".join(f"<th>{c}</th>" for c in COLS) + "<th>Status</th>"
     body = ""
@@ -1303,10 +1419,10 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
     thin = Side(style="thin", color="E2E8F0")
     bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    COLS = ["Unit No","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
+    COLS = ["Unit No","Unit Type","Unit Size (SF)","Market Rent (Monthly)","Effective Rent (Monthly)",
             "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
-    DATE_COLS  = {5, 6, 7, 8}
-    MONEY_COLS = {3, 4}
+    DATE_COLS  = {6, 7, 8, 9}   # Move In, Lease Start, Lease End, Move Out (shifted +1)
+    MONEY_COLS = {4, 5}          # Market Rent, Effective Rent (shifted +1)
 
     # Sheet 1: Standardized
     ws = wb.active; ws.title = "Standardized Rent Roll"
@@ -1333,7 +1449,7 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
             c = ws.cell(row=ri, column=col, value=val)
             c.border = bdr; c.fill = fill
             c.font = Font(name="Calibri", size=10, italic=(iv or nr), color=fc)
-            if col == 2:             c.number_format = "#,##0";     c.alignment = Alignment(horizontal="right")
+            if col == 3:             c.number_format = "#,##0";     c.alignment = Alignment(horizontal="right")  # Sq Ft
             elif col in MONEY_COLS:  c.number_format = "$#,##0.00"; c.alignment = Alignment(horizontal="right")
             elif col in DATE_COLS:   c.alignment = Alignment(horizontal="center")
             else:                    c.alignment = Alignment(horizontal="left")
@@ -1345,9 +1461,10 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
         c.font = Font(name="Calibri", bold=True, color="FFFFFF", size=10)
         c.border = bdr; c.alignment = Alignment(horizontal="right")
     ws.cell(row=tot, column=1, value="TOTALS / AVERAGES").alignment = Alignment(horizontal="left")
-    ws.cell(row=tot, column=2, value=f"=SUM(B2:B{last})").number_format = "#,##0"
-    ws.cell(row=tot, column=3, value=f"=AVERAGE(C2:C{last})").number_format = "$#,##0.00"
-    ws.cell(row=tot, column=4, value=f'=AVERAGEIF(D2:D{last},"<>",D2:D{last})').number_format = "$#,##0.00"
+    # col2 = Unit Type — no formula
+    ws.cell(row=tot, column=3, value=f"=SUM(C2:C{last})").number_format = "#,##0"           # Sq Ft
+    ws.cell(row=tot, column=4, value=f"=AVERAGE(D2:D{last})").number_format = "$#,##0.00"   # Market Rent
+    ws.cell(row=tot, column=5, value=f'=AVERAGEIF(E2:E{last},"<>",E2:E{last})').number_format = "$#,##0.00"  # Eff Rent
 
     nr2 = tot + 2
     for i, note in enumerate(["Notes:",
@@ -1361,7 +1478,7 @@ def build_excel(df: pd.DataFrame, raw_df: pd.DataFrame = None,
                             "92400E" if "Yellow" in note else
                             "854D0E" if "Orange" in note else "595959")
 
-    for i, w in enumerate([14, 14, 22, 24, 14, 16, 16, 14, 28], 1):
+    for i, w in enumerate([14, 16, 10, 22, 22, 14, 16, 16, 14, 28], 1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(COLS))}{last}"
@@ -1553,7 +1670,7 @@ st.markdown("""
     </div>
   </div>
   <div class="rv-hero-right">
-    <span class="rv-version">v5.7</span>
+    <span class="rv-version">v5.8</span>
     <div class="rv-badge">⚡ Claude AI</div>
   </div>
 </div>
@@ -1648,8 +1765,8 @@ with main_tab:
 
             # Show detected format as a small badge
             fmt = col_map.get("fmt", "unknown")
-            fmt_labels = {"yardi": "Yardi / MRI", "appfolio": "AppFolio", "vesper": "Vesper / Sunbelt", "unknown": "Unknown"}
-            fmt_colors = {"yardi": "#60a5fa", "appfolio": "#34d399", "vesper": "#f59e0b", "unknown": "#94a3b8"}
+            fmt_labels = {"yardi": "Yardi / MRI", "appfolio": "AppFolio", "vesper": "Vesper / Sunbelt", "onsite": "OneSite / RealPage", "unknown": "Unknown"}
+            fmt_colors = {"yardi": "#60a5fa", "appfolio": "#34d399", "vesper": "#f59e0b", "onsite": "#c084fc", "unknown": "#94a3b8"}
             fmt_label = fmt_labels.get(fmt, fmt)
             fmt_color = fmt_colors.get(fmt, "#94a3b8")
             st.markdown(
