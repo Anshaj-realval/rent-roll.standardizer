@@ -2117,7 +2117,12 @@ with main_tab:
             # ── QA Verification Panel ──────────────────────────────────────────
             st.markdown("<div class='sec-label'>Pre-Download Verification</div>", unsafe_allow_html=True)
             qa_checks = run_qa_checks(standardized_df, original_df)
-            st.markdown(render_qa_panel(qa_checks), unsafe_allow_html=True)
+            qa_html = render_qa_panel(qa_checks)
+            st.components.v1.html(
+                f"<style>*{{font-family:Inter,sans-serif;box-sizing:border-box;}}</style>{qa_html}",
+                height=60 + len(qa_checks) * 72,
+                scrolling=False
+            )
 
             # Download
             st.markdown("<div class='sec-label'>Download</div>", unsafe_allow_html=True)
