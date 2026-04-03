@@ -645,10 +645,11 @@ def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
         col_lock = "COLUMN RULE: EffRent = 'Charge Amount' where Charge Code = rent. Never use Market Rent or Deposit."
 
     return f"""Multifamily rent roll standardizer. ({PROMPT_VERSION})
-Output: JSON array. Each object MUST have exactly these 9 fields:
-  "Unit No" | "Unit Size (SF)" | "Market Rent (Monthly)" | "Effective Rent (Monthly)" | "Move In Date" | "Lease Start Date" | "Lease End Date" | "Move Out Date" | "Tenant Name"
-Also include "Unit Type" (floorplan/type code from col1) and optional "flag" field.
-IMPORTANT: Output these field names EXACTLY as shown. Do not rename, reorder, or skip any.
+Output: JSON array. Each object MUST have exactly these 10 fields — all required, no exceptions:
+  "Unit No" | "Unit Type" | "Unit Size (SF)" | "Market Rent (Monthly)" | "Effective Rent (Monthly)" | "Move In Date" | "Lease Start Date" | "Lease End Date" | "Move Out Date" | "Tenant Name"
+CRITICAL: "Unit Type" is REQUIRED. Read it from the column named "Unit Type" in the data. If the unit has no floorplan, use null — but never omit the field.
+Optional: "flag" (boolean, true if uncertain).
+Output these field names EXACTLY. Do not rename, reorder, or skip any.
 
 {format_note}
 {col_lock}
@@ -976,7 +977,6 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
             "Move In Date","Lease Start Date","Lease End Date","Move Out Date","Tenant Name"]
     for col in COLS:
         if col not in result_df.columns: result_df[col] = None
-    # Unit Type: include if Claude returned it (bonus field), else add blank column at end
     if "Unit Type" not in result_df.columns:
         result_df["Unit Type"] = None
     result_df = result_df[COLS + ["Unit Type"] + (["flag"] if "flag" in result_df.columns else [])]
@@ -986,6 +986,30 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
 
     result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
     result_df.reset_index(drop=True, inplace=True)
+
+    # ── Unit Type safety net: if Claude missed it, read directly from raw file ──
+    # Looks up the Unit Type column in the labelled dataframe by unit number
+    missing_type = result_df["Unit Type"].isna() | (result_df["Unit Type"].astype(str).str.strip().isin(["", "None", "nan"]))
+    if missing_type.any() and raw_df is not None and col_map.get("unit_type") is not None:
+        unit_col = col_map.get("unit", 0)
+        type_col = col_map["unit_type"]
+        # Build unit → type lookup from labelled raw data
+        try:
+            labelled_for_type, _ = label_raw_df(raw_df.copy())
+            if "Unit Type" in labelled_for_type.columns and "Unit No" in labelled_for_type.columns:
+                type_lookup = (
+                    labelled_for_type[labelled_for_type["Unit Type"].notna() &
+                                      (labelled_for_type["Unit Type"].astype(str).str.strip() != "")]
+                    .drop_duplicates(subset=["Unit No"])
+                    .set_index("Unit No")["Unit Type"]
+                    .to_dict()
+                )
+                for idx in result_df.index[missing_type]:
+                    unit = str(result_df.at[idx, "Unit No"]).strip()
+                    if unit in type_lookup:
+                        result_df.at[idx, "Unit Type"] = type_lookup[unit]
+        except Exception:
+            pass
 
     # Step 1: Python-level rent recovery (fixes Claude misses from raw file)
     result_df = recover_missing_rents(result_df, raw_df, col_map)
