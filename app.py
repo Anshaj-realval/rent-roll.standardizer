@@ -2168,6 +2168,75 @@ with main_tab:
             with tab_clean:
                 st.markdown(render_table(standardized_df), unsafe_allow_html=True)
 
+            # ── Format Memory Feedback ─────────────────────────────────────────
+            # Must appear BEFORE download so it survives the download button click.
+            # Uses session_state to persist field values across reruns.
+            st.markdown("<div class='sec-label'>Format Memory</div>", unsafe_allow_html=True)
+            st.markdown("""
+            <div style='background:#0a1628;border:1px solid rgba(255,255,255,0.08);
+                        border-radius:12px;padding:1.1rem 1.3rem;margin-bottom:1rem;'>
+              <div style='font-size:0.82rem;font-weight:600;color:#93c5fd;margin-bottom:0.4rem;'>
+                📝 Any errors in the output? Save them here before downloading.
+              </div>
+              <div style='font-size:0.74rem;color:rgba(255,255,255,0.4);line-height:1.5;'>
+                The tool fingerprints this file's column structure and charge codes.
+                Next time any file with the <strong>same broker export format</strong>
+                is uploaded (even a different property), these corrections are applied
+                automatically before processing starts.
+              </div>
+            </div>""", unsafe_allow_html=True)
+
+            mem_col1, mem_col2 = st.columns([1, 2])
+            with mem_col1:
+                mem_property = st.text_input(
+                    "Property name",
+                    placeholder="e.g. Arbor of Euless",
+                    key="mem_property"
+                )
+            with mem_col2:
+                mem_feedback = st.text_area(
+                    "What was wrong / what to remember",
+                    height=90,
+                    placeholder='e.g. "Rent code is rnta. No Lease Start column. Unit Type in col labelled Type."',
+                    key="mem_feedback"
+                )
+
+            mem_col3, mem_col4 = st.columns([2, 1])
+            with mem_col3:
+                mem_codes = st.text_input(
+                    "Rent charge codes for this format (comma-separated)",
+                    placeholder="e.g. rnta, subsidy, hap",
+                    key="mem_codes"
+                )
+            with mem_col4:
+                st.markdown("<div style='height:1.8rem'></div>", unsafe_allow_html=True)
+                save_clicked = st.button("💾  Save to Memory", key="save_memory_btn")
+
+            if save_clicked:
+                if mem_property.strip() and mem_feedback.strip():
+                    codes = [c.strip().lower() for c in mem_codes.split(",") if c.strip()]
+                    result = save_memory_entry(
+                        property_name = mem_property.strip(),
+                        feedback      = mem_feedback.strip(),
+                        fmt           = col_map.get("fmt", "unknown"),
+                        raw_df        = original_df,
+                        file_name     = uploaded_file.name,
+                        charge_codes  = codes,
+                    )
+                    if result == "updated":
+                        st.success(f"✅ Memory updated for **{mem_property.strip()}**. Will apply to all future files with this format.")
+                    else:
+                        st.success(f"✅ Memory saved for **{mem_property.strip()}**. Will apply automatically to future files with this format.")
+                else:
+                    st.warning("Enter a property name and describe the errors before saving.")
+
+            if memory_ctx:
+                st.markdown(
+                    "<div style='font-size:0.73rem;color:#10b981;margin-top:0.2rem;'>"
+                    "⚡ Format memory was applied to this file during processing.</div>",
+                    unsafe_allow_html=True
+                )
+
             # Download
             st.markdown("<div class='sec-label'>Download</div>", unsafe_allow_html=True)
             today     = date.today().strftime("%m%d%Y")
@@ -2183,72 +2252,6 @@ with main_tab:
             with col_hint_dl:
                 if flag_count:
                     st.markdown(f"<div style='padding-top:0.7rem;font-size:0.78rem;color:#fbbf24;'>⚠ {flag_count} flagged rows included — review before use</div>", unsafe_allow_html=True)
-
-            # ── Format Memory Feedback ─────────────────────────────────────────
-            st.markdown("<div class='sec-label'>Format Memory</div>", unsafe_allow_html=True)
-            st.markdown("""
-            <div style='background:#0a1628;border:1px solid rgba(255,255,255,0.08);border-radius:12px;
-                        padding:1.1rem 1.3rem;margin-bottom:1rem;'>
-              <div style='font-size:0.82rem;font-weight:600;color:#93c5fd;margin-bottom:0.4rem;'>
-                📝 Was the output correct?
-              </div>
-              <div style='font-size:0.74rem;color:rgba(255,255,255,0.4);line-height:1.5;'>
-                If there were errors, describe them below. The tool fingerprints this file's
-                column structure and charge codes — next time any file with the <strong>same
-                broker export format</strong> is uploaded (even a different property), these
-                corrections are applied automatically.
-              </div>
-            </div>""", unsafe_allow_html=True)
-
-            mem_col1, mem_col2 = st.columns([1, 2])
-            with mem_col1:
-                mem_property = st.text_input(
-                    "Property name",
-                    placeholder="e.g. Arbor of Euless",
-                    key="mem_property"
-                )
-            with mem_col2:
-                mem_feedback = st.text_area(
-                    "What was wrong / what to remember",
-                    height=90,
-                    placeholder='e.g. "Rent code is rnta not rent. No Lease Start column — set to null. Unit Type in col1 labelled Type."',
-                    key="mem_feedback"
-                )
-
-            mem_col3, mem_col4 = st.columns([2, 1])
-            with mem_col3:
-                mem_codes = st.text_input(
-                    "Rent charge codes for this property (comma-separated)",
-                    placeholder="e.g. rnta, subsidy, hap",
-                    key="mem_codes"
-                )
-            with mem_col4:
-                st.markdown("<div style='height:1.8rem'></div>", unsafe_allow_html=True)
-                if st.button("💾  Save to Memory", key="save_memory_btn"):
-                    if mem_property.strip() and mem_feedback.strip():
-                        codes = [c.strip().lower() for c in mem_codes.split(",") if c.strip()]
-                        result = save_memory_entry(
-                            property_name = mem_property.strip(),
-                            feedback      = mem_feedback.strip(),
-                            fmt           = col_map.get("fmt", "unknown"),
-                            raw_df        = original_df,
-                            file_name     = uploaded_file.name,
-                            charge_codes  = codes,
-                        )
-                        if result == "updated":
-                            st.success(f"✅ Memory updated for **{mem_property.strip()}** — will apply next time this file is processed.")
-                        else:
-                            st.success(f"✅ Memory saved for **{mem_property.strip()}** — will apply automatically next time.")
-                    else:
-                        st.warning("Enter a property name and feedback before saving.")
-
-            # Show if memory was used for this file
-            if memory_ctx:
-                st.markdown(
-                    "<div style='font-size:0.73rem;color:#10b981;margin-top:0.3rem;'>"
-                    "⚡ Format memory was applied to this file during processing.</div>",
-                    unsafe_allow_html=True
-                )
 
     else:
         st.markdown("""
