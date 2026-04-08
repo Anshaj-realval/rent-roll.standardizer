@@ -611,10 +611,11 @@ def _save_memory(memories: list):
 
 def _fingerprint(raw_df: pd.DataFrame, fmt: str, file_name: str) -> dict:
     """
-    Build a fingerprint that uniquely identifies a rent roll format.
-    Used to match future files to saved memories.
+    Build a fingerprint that uniquely identifies a rent roll FORMAT.
+    Designed to match across different properties from the same broker/software.
+    Key signals: column header names + detected format + charge codes found.
     """
-    # Extract property name from first few rows
+    # Extract property name (best-effort, not used for primary matching)
     property_name = ""
     for val in raw_df.iloc[:8, 0].dropna().astype(str):
         v = val.strip()
@@ -622,42 +623,79 @@ def _fingerprint(raw_df: pd.DataFrame, fmt: str, file_name: str) -> dict:
             property_name = v[:60]
             break
 
-    # Header columns fingerprint — first 6 non-empty header-like values
+    # Collect ALL non-empty header-like values from first 15 rows
+    # These are the column names that define the format
     header_cols = []
-    for val in raw_df.iloc[:12].values.flatten():
+    seen = set()
+    for val in raw_df.iloc[:15].values.flatten():
         s = str(val).strip().lower() if val is not None else ""
-        if s and s not in ("nan","0","1","2","3","4","5","6","7","8","9") and len(s) > 1:
-            header_cols.append(s[:20])
-        if len(header_cols) >= 6:
+        if (s and s not in ("nan","0","1","2","3","4","5","6","7","8","9")
+                and len(s) > 1 and len(s) < 35 and s not in seen
+                and not s.replace(".","").replace("/","").replace("-","").isdigit()):
+            header_cols.append(s[:30])
+            seen.add(s)
+        if len(header_cols) >= 15:
+            break
+
+    # Collect charge codes from the file — strong format discriminator
+    # Blair uses full-text like "Rent: Resident", Yardi uses short codes like "rent"
+    charge_codes = []
+    seen_codes = set()
+    for val in raw_df.values.flatten():
+        s = str(val).strip().lower() if val is not None else ""
+        if (s and len(s) >= 2 and len(s) <= 25 and s not in seen_codes
+                and s not in ("nan","none","total","resident","vacant","current")):
+            # Looks like a charge code: short, no spaces (or few words)
+            words = s.split()
+            if len(words) <= 4 and not s.replace(".","").replace(",","").replace("-","").isdigit():
+                charge_codes.append(s)
+                seen_codes.add(s)
+        if len(charge_codes) >= 20:
             break
 
     return {
         "property_name": property_name,
-        "fmt": fmt,
-        "header_cols": header_cols,
-        "file_stem": os.path.splitext(file_name)[0][:40] if file_name else "",
+        "fmt":           fmt,
+        "header_cols":   header_cols,
+        "charge_codes":  charge_codes,
+        "file_stem":     os.path.splitext(file_name)[0][:40] if file_name else "",
     }
 
 def _match_score(fp1: dict, fp2: dict) -> float:
     """
     Score how well two fingerprints match (0.0 to 1.0).
-    1.0 = same property + same format. 0.5 = same format fingerprint, different property.
+    Weights are deliberately format/header heavy — same property is rare,
+    but same broker software/export format is common across different properties.
     """
     score = 0.0
-    # Same format
-    if fp1.get("fmt") == fp2.get("fmt"):
-        score += 0.3
-    # Property name similarity (simple token overlap)
-    p1 = set(fp1.get("property_name","").lower().split())
-    p2 = set(fp2.get("property_name","").lower().split())
+
+    # Same detected format (yardi/appfolio/onsite/unknown) — strong signal
+    if fp1.get("fmt") == fp2.get("fmt") and fp1.get("fmt") != "unknown":
+        score += 0.4
+
+    # Header column overlap — the most reliable fingerprint across different properties
+    # Same broker export always produces the same column names regardless of property
+    h1 = set(fp1.get("header_cols", []))
+    h2 = set(fp2.get("header_cols", []))
+    if h1 and h2:
+        overlap = len(h1 & h2) / max(len(h1 | h2), 1)
+        score += overlap * 0.5
+
+    # Charge code overlap — distinguishes Blair full-text from Yardi short codes
+    c1 = set(fp1.get("charge_codes", []))
+    c2 = set(fp2.get("charge_codes", []))
+    if c1 and c2:
+        overlap = len(c1 & c2) / max(len(c1 | c2), 1)
+        score += overlap * 0.1
+
+    # Property name similarity — low weight, only a tiebreaker
+    # (same property twice is rare — don't penalise different property names)
+    p1 = set(fp1.get("property_name", "").lower().split())
+    p2 = set(fp2.get("property_name", "").lower().split())
     if p1 and p2:
         overlap = len(p1 & p2) / max(len(p1 | p2), 1)
-        score += overlap * 0.5
-    # Header columns overlap
-    h1 = set(fp1.get("header_cols",[]))
-    h2 = set(fp2.get("header_cols",[]))
-    if h1 and h2:
-        score += (len(h1 & h2) / max(len(h1 | h2), 1)) * 0.2
+        score += overlap * 0.1
+
     return score
 
 def find_matching_memories(raw_df: pd.DataFrame, fmt: str, file_name: str) -> list:
@@ -687,13 +725,12 @@ def build_memory_context(raw_df: pd.DataFrame, fmt: str, file_name: str) -> str:
         return ""
     lines = []
     for m in matches:
-        score_label = "EXACT MATCH" if m.get("score", 0) >= 0.8 else "SIMILAR FORMAT"
-        lines.append(f"\n⚡ REMEMBERED FORMAT [{score_label}] — {m['property_name']} ({m['date']})")
-        lines.append(f"Notes from previous processing: {m['feedback']}")
+        prop  = m.get("property_name", "Unknown")
+        saved = m.get("date", "")
+        lines.append(f"\n⚡ REMEMBERED FORMAT — previously processed: {prop} ({saved})")
+        lines.append(f"Apply these corrections to this file: {m['feedback']}")
         if m.get("charge_codes"):
-            lines.append(f"Known rent codes for this property: {', '.join(m['charge_codes'])}")
-        if m.get("known_issues"):
-            lines.append(f"Known issues to avoid: {m['known_issues']}")
+            lines.append(f"Rent charge codes confirmed for this format: {', '.join(m['charge_codes'])}")
     return "\n".join(lines)
 
 def save_memory_entry(property_name: str, feedback: str, fmt: str,
@@ -2156,8 +2193,10 @@ with main_tab:
                 📝 Was the output correct?
               </div>
               <div style='font-size:0.74rem;color:rgba(255,255,255,0.4);line-height:1.5;'>
-                If there were errors, describe them below. The tool will remember this format
-                and apply your corrections automatically next time this property is processed.
+                If there were errors, describe them below. The tool fingerprints this file's
+                column structure and charge codes — next time any file with the <strong>same
+                broker export format</strong> is uploaded (even a different property), these
+                corrections are applied automatically.
               </div>
             </div>""", unsafe_allow_html=True)
 
