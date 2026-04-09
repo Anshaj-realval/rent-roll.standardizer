@@ -3,7 +3,7 @@
     "property_name": "Stone Loch",
     "fmt": "yardi",
     "date": "04/09/2026",
-    "feedback": "Unit No 04302, it picked up conone instead of rentmkt\nUnit No 05109, it picked up conone instead of rentmkt",
+    "feedback": "Unit No 03309, it picked up the market rent instead of rentmkt\nUnit No 04202, it picked up the conone instead of rentmkt\nUnit No 07302, it has reduced the congar from rentmkt which was not necessary",
     "charge_codes": [
       "rentmkt"
     ],
