@@ -301,34 +301,61 @@ def detect_format(combined_headers: list[str], is_split_header: bool) -> str:
 def preprocess_onsite(df: pd.DataFrame) -> pd.DataFrame:
     """
     Pre-processes OneSite/RealPage exports before label_raw_df runs.
-    Handles three OneSite-specific issues:
-      1. Repeating page headers (~every 68 rows) — detected by '\nUnit' in col1
-      2. Interleaved Pending/Applicant future-lease rows — col8='N/A' or col20='N/A'
-         with Pending/Applicant in the next column
-      3. Embedded newlines in column headers (cleaned in label_raw_df's clean())
+    Handles OneSite-specific issues:
+      1. Repeating page headers — detected by CONTENT (OneSite version string, date/time,
+         Parameters line, 'details' label). Works for ALL OneSite variants regardless of
+         which column the header lands in.
+      2. Asterisk footnote rows ('* indicates amounts not included...')
+      3. Interleaved Pending/Applicant future-lease rows
+      4. Blank spacing rows
     """
     vals = list(df.values)
     keep = []
+    skip_next = 0  # used to skip header block rows after a page-break trigger
+
     for row in vals:
-        # Strip repeating page-break header rows
-        c1 = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ''
-        if '\nUnit' in c1 or c1 == '\nUnit':
-            continue
-        # Strip section labels like 'details', 'Other\nCharges/ Credits'
         c0 = str(row[0]).strip() if row[0] is not None else ''
-        if c0.lower() in ('details', 'other\ncharges/ credits', 'other charges/ credits'):
+        c0_lower = c0.lower()
+
+        # Skip if we're in the middle of a page header block
+        if skip_next > 0:
+            skip_next -= 1
             continue
-        # Strip Pending/Applicant interleaved rows (future leases)
-        # These have no real unit number — col1 is N/A
-        if c1 == 'N/A':
-            status_col = str(row[20]).strip() if len(row) > 20 and row[20] is not None else ''
-            if 'pending' in status_col.lower() or 'applicant' in status_col.lower():
-                continue
-        keep.append(row)
+
+        # Detect page-break triggers and skip the full header block that follows
+        # Pattern: 'OneSite Rents' or 'Rent Roll Detail' title row → skip next 8 rows
+        if 'onesite rents' in c0_lower or ('rent roll detail' in c0_lower and len(c0) < 40):
+            skip_next = 7   # skip: datetime, as-of, parameters, details, other, col-header-1, col-header-2
+            continue
+
+        # Asterisk footnote rows — always junk
+        if c0.startswith('*'):
+            continue
+
+        # Section label rows
+        if c0_lower in ('details', 'other', 'other\ncharges/ credits', 'other charges/ credits'):
+            continue
+
+        # Timberlakes-style: '\nUnit' in col1
+        c1 = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ''
+        if '\nUnit' in c1:
+            continue
+
+        # Pending/Applicant future-lease rows
+        for idx in [20, 8, 4]:
+            if len(row) > idx and row[idx] is not None:
+                v = str(row[idx]).strip().lower()
+                if 'pending' in v or 'applicant' in v:
+                    # Skip only if col0 is N/A (no real unit number)
+                    if c0 in ('N/A', ''):
+                        break
+        else:
+            keep.append(row)
+            continue
+        # Reached here only if we hit the break above
+        continue
 
     result = pd.DataFrame(keep, columns=df.columns)
-
-    # Drop blank rows (OneSite puts a blank row between every unit block)
     result = result.dropna(how='all').reset_index(drop=True)
     return result
 
@@ -345,9 +372,22 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     header_row = None
 
     for i, row in enumerate(vals[:15]):
-        texts = [str(v).lower().strip() for v in row if v is not None and str(v).strip().lower() != 'nan']
+        # Only consider non-null cell values individually
+        cells = [str(v).strip() for v in row if v is not None and str(v).strip().lower() != 'nan']
+        if not cells:
+            continue
+
+        # IMPORTANT: reject rows where the keywords are embedded inside a single long
+        # paragraph string (e.g. the OneSite "Parameters: Properties - ALL;Show all unit
+        # designations...market + addl..." row). A real header row has MULTIPLE short
+        # cells — each cell is a column name, not a paragraph.
+        # Require: at least 2 non-empty cells, and the longest cell must be < 40 chars.
+        if len(cells) < 2 or max(len(c) for c in cells) > 40:
+            continue
+
+        texts = [c.lower() for c in cells]
         has_unit   = any("unit" in t or "bldg" in t for t in texts)
-        has_charge = any(kw in t for t in texts for kw in ("charge", "rent", "market", "amount", "scheduled", "budgeted"))
+        has_charge = any(kw in t for t in texts for kw in ("charge", "rent", "market", "amount", "scheduled", "budgeted", "trans", "lease"))
         if has_unit and has_charge:
             header_row = i
             break
