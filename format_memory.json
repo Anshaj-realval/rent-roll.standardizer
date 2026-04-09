@@ -1,0 +1,56 @@
+[
+  {
+    "property_name": "Stone Loch",
+    "fmt": "yardi",
+    "date": "04/09/2026",
+    "feedback": "Unit No 04302, it picked up conone instead of rentmkt\nUnit No 05109, it picked up conone instead of rentmkt",
+    "charge_codes": [
+      "rentmkt"
+    ],
+    "known_issues": "",
+    "fingerprint": {
+      "property_name": "Stone Loch",
+      "fmt": "yardi",
+      "header_cols": [
+        "rent roll with lease charges",
+        "stone loch (stnloch)",
+        "as of = 08/04/2025",
+        "month year = 08/2024",
+        "unit",
+        "unit type",
+        "resident",
+        "name",
+        "market",
+        "charge",
+        "amount",
+        "other",
+        "move in",
+        "lease",
+        "move out"
+      ],
+      "charge_codes": [
+        "stone loch (stnloch)",
+        "as of = 08/04/2025",
+        "month year = 08/2024",
+        "unit",
+        "unit type",
+        "name",
+        "market",
+        "charge",
+        "amount",
+        "other",
+        "move in",
+        "lease",
+        "move out",
+        "balance",
+        "sq ft",
+        "rent",
+        "code",
+        "deposit",
+        "expiration",
+        "stl-b2"
+      ],
+      "file_stem": "Stone Loch - RentRollwithLeaseCharges08_"
+    }
+  }
+]
