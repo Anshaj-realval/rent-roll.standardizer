@@ -1302,29 +1302,35 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
-    # ── Unit Type: always fill from raw file directly — don't rely on Claude ──
-    # Build a unit→type lookup from the labelled raw dataframe.
-    # This guarantees Unit Type is populated regardless of whether Claude returned it.
-    if raw_df is not None and col_map.get("unit_type") is not None:
+    # ── Unit Type: fill from the labelled dataframe directly ──
+    # labelled_df already has Unit Type correctly populated from label_raw_df.
+    # Build a unit→type lookup and write it into result_df unconditionally.
+    # This bypasses Claude entirely for Unit Type — it's always read from source.
+    if "Unit Type" in labelled_df.columns and "Unit No" in labelled_df.columns:
         try:
-            labelled_for_type, _ = label_raw_df(raw_df.copy())
-            if "Unit Type" in labelled_for_type.columns and "Unit No" in labelled_for_type.columns:
-                type_lookup = (
-                    labelled_for_type[
-                        labelled_for_type["Unit Type"].notna() &
-                        (labelled_for_type["Unit Type"].astype(str).str.strip() != "") &
-                        (labelled_for_type["Unit Type"].astype(str).str.strip() != "nan")
-                    ]
-                    .drop_duplicates(subset=["Unit No"])
-                    .set_index("Unit No")["Unit Type"]
-                    .to_dict()
-                )
+            # Only use rows where Unit No looks like a real unit number
+            # (filters out page-header contamination like 'OneSite Rents v3.0')
+            unit_mask = (
+                labelled_df["Unit No"].notna() &
+                labelled_df["Unit Type"].notna() &
+                (labelled_df["Unit No"].astype(str).str.strip() != "") &
+                (labelled_df["Unit No"].astype(str).str.strip() != "nan") &
+                (labelled_df["Unit Type"].astype(str).str.strip() != "") &
+                (labelled_df["Unit Type"].astype(str).str.strip() != "nan")
+            )
+            type_lookup = (
+                labelled_df[unit_mask]
+                .drop_duplicates(subset=["Unit No"], keep="first")
+                .set_index("Unit No")["Unit Type"]
+                .to_dict()
+            )
+            if type_lookup:
                 for idx in result_df.index:
                     unit = str(result_df.at[idx, "Unit No"]).strip()
                     if unit in type_lookup:
                         result_df.at[idx, "Unit Type"] = type_lookup[unit]
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Unit Type fill] error: {e}")
 
     # Step 1: Python-level rent recovery (fixes Claude misses from raw file)
     result_df = recover_missing_rents(result_df, raw_df, col_map)
