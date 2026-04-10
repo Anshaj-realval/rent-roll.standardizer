@@ -303,19 +303,29 @@ def preprocess_onsite(df: pd.DataFrame) -> pd.DataFrame:
     Pre-processes OneSite/RealPage exports before label_raw_df runs.
     Handles OneSite-specific issues:
       1. Repeating page headers — detected by CONTENT (OneSite version string, date/time,
-         Parameters line, 'details' label). Works for ALL OneSite variants regardless of
-         which column the header lands in.
+         Parameters line, 'details' label). Works for ALL OneSite variants.
       2. Asterisk footnote rows ('* indicates amounts not included...')
-      3. Interleaved Pending/Applicant future-lease rows
-      4. Blank spacing rows
+      3. Summary/statistics table at end of file (floorplan mix table, billing summary)
+      4. Interleaved Pending/Applicant future-lease rows
+      5. Blank spacing rows
     """
     vals = list(df.values)
     keep = []
-    skip_next = 0  # used to skip header block rows after a page-break trigger
+    skip_next = 0
+    in_summary = False   # once we hit the summary table, skip everything
 
     for row in vals:
         c0 = str(row[0]).strip() if row[0] is not None else ''
         c0_lower = c0.lower()
+
+        # Once we hit the end-of-file summary table, stop keeping rows
+        # Detected by: 'totals / averages:' or 'Amt / SQFT:' or 'occupancy and rent'
+        if any(marker in c0_lower for marker in
+               ('totals / averages:', 'totals:', 'amt / sqft:', 'occupancy and rent',
+                'summary billing by', 'leased amt / sqft')):
+            in_summary = True
+        if in_summary:
+            continue
 
         # Skip if we're in the middle of a page header block
         if skip_next > 0:
@@ -323,7 +333,6 @@ def preprocess_onsite(df: pd.DataFrame) -> pd.DataFrame:
             continue
 
         # Detect page-break triggers and skip the full header block that follows
-        # Pattern: 'OneSite Rents' or 'Rent Roll Detail' title row → skip next 8 rows
         if 'onesite rents' in c0_lower or ('rent roll detail' in c0_lower and len(c0) < 40):
             skip_next = 7   # skip: datetime, as-of, parameters, details, other, col-header-1, col-header-2
             continue
@@ -346,13 +355,11 @@ def preprocess_onsite(df: pd.DataFrame) -> pd.DataFrame:
             if len(row) > idx and row[idx] is not None:
                 v = str(row[idx]).strip().lower()
                 if 'pending' in v or 'applicant' in v:
-                    # Skip only if col0 is N/A (no real unit number)
                     if c0 in ('N/A', ''):
                         break
         else:
             keep.append(row)
             continue
-        # Reached here only if we hit the break above
         continue
 
     result = pd.DataFrame(keep, columns=df.columns)
@@ -1295,24 +1302,24 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
-    # ── Unit Type safety net: if Claude missed it, read directly from raw file ──
-    # Looks up the Unit Type column in the labelled dataframe by unit number
-    missing_type = result_df["Unit Type"].isna() | (result_df["Unit Type"].astype(str).str.strip().isin(["", "None", "nan"]))
-    if missing_type.any() and raw_df is not None and col_map.get("unit_type") is not None:
-        unit_col = col_map.get("unit", 0)
-        type_col = col_map["unit_type"]
-        # Build unit → type lookup from labelled raw data
+    # ── Unit Type: always fill from raw file directly — don't rely on Claude ──
+    # Build a unit→type lookup from the labelled raw dataframe.
+    # This guarantees Unit Type is populated regardless of whether Claude returned it.
+    if raw_df is not None and col_map.get("unit_type") is not None:
         try:
             labelled_for_type, _ = label_raw_df(raw_df.copy())
             if "Unit Type" in labelled_for_type.columns and "Unit No" in labelled_for_type.columns:
                 type_lookup = (
-                    labelled_for_type[labelled_for_type["Unit Type"].notna() &
-                                      (labelled_for_type["Unit Type"].astype(str).str.strip() != "")]
+                    labelled_for_type[
+                        labelled_for_type["Unit Type"].notna() &
+                        (labelled_for_type["Unit Type"].astype(str).str.strip() != "") &
+                        (labelled_for_type["Unit Type"].astype(str).str.strip() != "nan")
+                    ]
                     .drop_duplicates(subset=["Unit No"])
                     .set_index("Unit No")["Unit Type"]
                     .to_dict()
                 )
-                for idx in result_df.index[missing_type]:
+                for idx in result_df.index:
                     unit = str(result_df.at[idx, "Unit No"]).strip()
                     if unit in type_lookup:
                         result_df.at[idx, "Unit Type"] = type_lookup[unit]
