@@ -2129,6 +2129,9 @@ with main_tab:
             run = st.button("⚡  Standardize Rent Roll")
 
         if run:
+            # Clear any cached result so this run always produces fresh output
+            st.session_state.pop("result", None)
+
             st.markdown("<div class='sec-label'>Processing</div>", unsafe_allow_html=True)
             step_ph   = st.empty()
             step_ph.markdown(render_steps(0), unsafe_allow_html=True)
