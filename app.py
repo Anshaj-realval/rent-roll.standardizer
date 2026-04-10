@@ -1302,33 +1302,33 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
-    # ── Unit Type: fill from the labelled dataframe directly ──
-    # labelled_df already has Unit Type correctly populated from label_raw_df.
-    # Build a unit→type lookup and write it into result_df unconditionally.
-    # This bypasses Claude entirely for Unit Type — it's always read from source.
-    if "Unit Type" in labelled_df.columns and "Unit No" in labelled_df.columns:
+    # ── Unit Type: fill directly from raw file using column positions ──
+    # Reads unit type values straight from raw_df using the col_map['unit_type'] position.
+    # This bypasses all column-naming and labelled_df complexity entirely.
+    # Works for every format: OneSite col1=Floorplan, Yardi col1=Unit Type, etc.
+    if raw_df is not None and col_map.get("unit_type") is not None:
         try:
-            # Only use rows where Unit No looks like a real unit number
-            # (filters out page-header contamination like 'OneSite Rents v3.0')
-            unit_mask = (
-                labelled_df["Unit No"].notna() &
-                labelled_df["Unit Type"].notna() &
-                (labelled_df["Unit No"].astype(str).str.strip() != "") &
-                (labelled_df["Unit No"].astype(str).str.strip() != "nan") &
-                (labelled_df["Unit Type"].astype(str).str.strip() != "") &
-                (labelled_df["Unit Type"].astype(str).str.strip() != "nan")
-            )
-            type_lookup = (
-                labelled_df[unit_mask]
-                .drop_duplicates(subset=["Unit No"], keep="first")
-                .set_index("Unit No")["Unit Type"]
-                .to_dict()
-            )
-            if type_lookup:
+            unit_col = col_map.get("unit", 0)
+            type_col = col_map["unit_type"]
+            raw_vals = raw_df.values
+            type_lookup_raw = {}
+            for row in raw_vals:
+                # Only process rows where col0 has a unit number (not sub-rows)
+                uval = row[unit_col] if len(row) > unit_col else None
+                tval = row[type_col] if len(row) > type_col else None
+                if (uval is not None and str(uval).strip() not in ("", "nan", "None")
+                        and tval is not None and str(tval).strip() not in ("", "nan", "None")):
+                    uid = str(uval).strip()
+                    tstr = str(tval).strip()
+                    # Only store if not already seen (keep first occurrence)
+                    # Skip contamination: type value shouldn't be longer than 40 chars
+                    if uid not in type_lookup_raw and len(tstr) <= 40:
+                        type_lookup_raw[uid] = tstr
+            if type_lookup_raw:
                 for idx in result_df.index:
                     unit = str(result_df.at[idx, "Unit No"]).strip()
-                    if unit in type_lookup:
-                        result_df.at[idx, "Unit Type"] = type_lookup[unit]
+                    if unit in type_lookup_raw:
+                        result_df.at[idx, "Unit Type"] = type_lookup_raw[unit]
         except Exception as e:
             print(f"[Unit Type fill] error: {e}")
 
