@@ -301,68 +301,34 @@ def detect_format(combined_headers: list[str], is_split_header: bool) -> str:
 def preprocess_onsite(df: pd.DataFrame) -> pd.DataFrame:
     """
     Pre-processes OneSite/RealPage exports before label_raw_df runs.
-    Handles OneSite-specific issues:
-      1. Repeating page headers — detected by CONTENT (OneSite version string, date/time,
-         Parameters line, 'details' label). Works for ALL OneSite variants.
-      2. Asterisk footnote rows ('* indicates amounts not included...')
-      3. Summary/statistics table at end of file (floorplan mix table, billing summary)
-      4. Interleaved Pending/Applicant future-lease rows
-      5. Blank spacing rows
+    Handles three OneSite-specific issues:
+      1. Repeating page headers (~every 68 rows) — detected by '\nUnit' in col1
+      2. Interleaved Pending/Applicant future-lease rows — col8='N/A' or col20='N/A'
+         with Pending/Applicant in the next column
+      3. Embedded newlines in column headers (cleaned in label_raw_df's clean())
     """
     vals = list(df.values)
     keep = []
-    skip_next = 0
-    in_summary = False   # once we hit the summary table, skip everything
-
     for row in vals:
-        c0 = str(row[0]).strip() if row[0] is not None else ''
-        c0_lower = c0.lower()
-
-        # Once we hit the end-of-file summary table, stop keeping rows
-        # Detected by: 'totals / averages:' or 'Amt / SQFT:' or 'occupancy and rent'
-        if any(marker in c0_lower for marker in
-               ('totals / averages:', 'totals:', 'amt / sqft:', 'occupancy and rent',
-                'summary billing by', 'leased amt / sqft')):
-            in_summary = True
-        if in_summary:
-            continue
-
-        # Skip if we're in the middle of a page header block
-        if skip_next > 0:
-            skip_next -= 1
-            continue
-
-        # Detect page-break triggers and skip the full header block that follows
-        if 'onesite rents' in c0_lower or ('rent roll detail' in c0_lower and len(c0) < 40):
-            skip_next = 7   # skip: datetime, as-of, parameters, details, other, col-header-1, col-header-2
-            continue
-
-        # Asterisk footnote rows — always junk
-        if c0.startswith('*'):
-            continue
-
-        # Section label rows
-        if c0_lower in ('details', 'other', 'other\ncharges/ credits', 'other charges/ credits'):
-            continue
-
-        # Timberlakes-style: '\nUnit' in col1
+        # Strip repeating page-break header rows
         c1 = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ''
-        if '\nUnit' in c1:
+        if '\nUnit' in c1 or c1 == '\nUnit':
             continue
-
-        # Pending/Applicant future-lease rows
-        for idx in [20, 8, 4]:
-            if len(row) > idx and row[idx] is not None:
-                v = str(row[idx]).strip().lower()
-                if 'pending' in v or 'applicant' in v:
-                    if c0 in ('N/A', ''):
-                        break
-        else:
-            keep.append(row)
+        # Strip section labels like 'details', 'Other\nCharges/ Credits'
+        c0 = str(row[0]).strip() if row[0] is not None else ''
+        if c0.lower() in ('details', 'other\ncharges/ credits', 'other charges/ credits'):
             continue
-        continue
+        # Strip Pending/Applicant interleaved rows (future leases)
+        # These have no real unit number — col1 is N/A
+        if c1 == 'N/A':
+            status_col = str(row[20]).strip() if len(row) > 20 and row[20] is not None else ''
+            if 'pending' in status_col.lower() or 'applicant' in status_col.lower():
+                continue
+        keep.append(row)
 
     result = pd.DataFrame(keep, columns=df.columns)
+
+    # Drop blank rows (OneSite puts a blank row between every unit block)
     result = result.dropna(how='all').reset_index(drop=True)
     return result
 
@@ -379,22 +345,9 @@ def label_raw_df(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     header_row = None
 
     for i, row in enumerate(vals[:15]):
-        # Only consider non-null cell values individually
-        cells = [str(v).strip() for v in row if v is not None and str(v).strip().lower() != 'nan']
-        if not cells:
-            continue
-
-        # IMPORTANT: reject rows where the keywords are embedded inside a single long
-        # paragraph string (e.g. the OneSite "Parameters: Properties - ALL;Show all unit
-        # designations...market + addl..." row). A real header row has MULTIPLE short
-        # cells — each cell is a column name, not a paragraph.
-        # Require: at least 2 non-empty cells, and the longest cell must be < 40 chars.
-        if len(cells) < 2 or max(len(c) for c in cells) > 40:
-            continue
-
-        texts = [c.lower() for c in cells]
+        texts = [str(v).lower().strip() for v in row if v is not None and str(v).strip().lower() != 'nan']
         has_unit   = any("unit" in t or "bldg" in t for t in texts)
-        has_charge = any(kw in t for t in texts for kw in ("charge", "rent", "market", "amount", "scheduled", "budgeted", "trans", "lease"))
+        has_charge = any(kw in t for t in texts for kw in ("charge", "rent", "market", "amount", "scheduled", "budgeted"))
         if has_unit and has_charge:
             header_row = i
             break
@@ -901,26 +854,11 @@ def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
         code_col = col_map.get("charge_code",   6)
         mkt_col  = col_map.get("market_rent",   5)
         dep_col  = col_map.get("deposit",        8)
-        type_col = col_map.get("unit_type",      None)
-        tenant_col = col_map.get("tenant",       None)
-
-        type_lock   = f" | Unit Type = col {type_col} (copy value as-is)" if type_col is not None else ""
-        tenant_lock = f" | Tenant Name = col {tenant_col}" if tenant_col is not None else ""
-
-        # If there's no charge_code column, this is a pre-calculated spreadsheet —
-        # Charge Amount IS the effective rent directly (no filtering by charge code needed)
-        if col_map.get("charge_code") is None:
-            col_lock = (
-                f"COLUMN LOCK — this file has pre-calculated rents (no charge code column).\n"
-                f"  Effective Rent = 'Charge Amount' column (col {amt_col}) directly — use as-is, no filtering.\n"
-                f"  Market Rent = col {mkt_col} (NEVER use as EffRent){type_lock}{tenant_lock}"
-            )
-        else:
-            col_lock = (
-                f"COLUMN LOCK — read Effective Rent from 'Charge Amount' (col {amt_col}) ONLY.\n"
-                f"  Charge Code = col {code_col} | Market Rent = col {mkt_col} (NEVER use as EffRent)"
-                f" | Deposit = col {dep_col} (NEVER use as EffRent){type_lock}{tenant_lock}"
-            )
+        col_lock = (
+            f"COLUMN LOCK — read Effective Rent from 'Charge Amount' (col {amt_col}) ONLY.\n"
+            f"  Charge Code = col {code_col} | Market Rent = col {mkt_col} (NEVER use as EffRent)"
+            f" | Deposit = col {dep_col} (NEVER use as EffRent)"
+        )
     else:
         col_lock = "COLUMN RULE: EffRent = 'Charge Amount' where Charge Code = rent. Never use Market Rent or Deposit."
 
@@ -1302,35 +1240,29 @@ def standardize_rent_roll(df, step_ph, prog_ph, status_ph, analyst_hint, library
     result_df.drop_duplicates(subset=["Unit No"], keep="first", inplace=True)
     result_df.reset_index(drop=True, inplace=True)
 
-    # ── Unit Type: fill directly from raw file using column positions ──
-    # Reads unit type values straight from raw_df using the col_map['unit_type'] position.
-    # This bypasses all column-naming and labelled_df complexity entirely.
-    # Works for every format: OneSite col1=Floorplan, Yardi col1=Unit Type, etc.
-    if raw_df is not None and col_map.get("unit_type") is not None:
+    # ── Unit Type safety net: if Claude missed it, read directly from raw file ──
+    # Looks up the Unit Type column in the labelled dataframe by unit number
+    missing_type = result_df["Unit Type"].isna() | (result_df["Unit Type"].astype(str).str.strip().isin(["", "None", "nan"]))
+    if missing_type.any() and raw_df is not None and col_map.get("unit_type") is not None:
+        unit_col = col_map.get("unit", 0)
+        type_col = col_map["unit_type"]
+        # Build unit → type lookup from labelled raw data
         try:
-            unit_col = col_map.get("unit", 0)
-            type_col = col_map["unit_type"]
-            raw_vals = raw_df.values
-            type_lookup_raw = {}
-            for row in raw_vals:
-                # Only process rows where col0 has a unit number (not sub-rows)
-                uval = row[unit_col] if len(row) > unit_col else None
-                tval = row[type_col] if len(row) > type_col else None
-                if (uval is not None and str(uval).strip() not in ("", "nan", "None")
-                        and tval is not None and str(tval).strip() not in ("", "nan", "None")):
-                    uid = str(uval).strip()
-                    tstr = str(tval).strip()
-                    # Only store if not already seen (keep first occurrence)
-                    # Skip contamination: type value shouldn't be longer than 40 chars
-                    if uid not in type_lookup_raw and len(tstr) <= 40:
-                        type_lookup_raw[uid] = tstr
-            if type_lookup_raw:
-                for idx in result_df.index:
+            labelled_for_type, _ = label_raw_df(raw_df.copy())
+            if "Unit Type" in labelled_for_type.columns and "Unit No" in labelled_for_type.columns:
+                type_lookup = (
+                    labelled_for_type[labelled_for_type["Unit Type"].notna() &
+                                      (labelled_for_type["Unit Type"].astype(str).str.strip() != "")]
+                    .drop_duplicates(subset=["Unit No"])
+                    .set_index("Unit No")["Unit Type"]
+                    .to_dict()
+                )
+                for idx in result_df.index[missing_type]:
                     unit = str(result_df.at[idx, "Unit No"]).strip()
-                    if unit in type_lookup_raw:
-                        result_df.at[idx, "Unit Type"] = type_lookup_raw[unit]
-        except Exception as e:
-            print(f"[Unit Type fill] error: {e}")
+                    if unit in type_lookup:
+                        result_df.at[idx, "Unit Type"] = type_lookup[unit]
+        except Exception:
+            pass
 
     # Step 1: Python-level rent recovery (fixes Claude misses from raw file)
     result_df = recover_missing_rents(result_df, raw_df, col_map)
@@ -2129,9 +2061,6 @@ with main_tab:
             run = st.button("⚡  Standardize Rent Roll")
 
         if run:
-            # Clear any cached result so this run always produces fresh output
-            st.session_state.pop("result", None)
-
             st.markdown("<div class='sec-label'>Processing</div>", unsafe_allow_html=True)
             step_ph   = st.empty()
             step_ph.markdown(render_steps(0), unsafe_allow_html=True)
