@@ -894,11 +894,26 @@ def build_prompt(chunk_text: str, chunk_num: int, total_chunks: int,
         code_col = col_map.get("charge_code",   6)
         mkt_col  = col_map.get("market_rent",   5)
         dep_col  = col_map.get("deposit",        8)
-        col_lock = (
-            f"COLUMN LOCK — read Effective Rent from 'Charge Amount' (col {amt_col}) ONLY.\n"
-            f"  Charge Code = col {code_col} | Market Rent = col {mkt_col} (NEVER use as EffRent)"
-            f" | Deposit = col {dep_col} (NEVER use as EffRent)"
-        )
+        type_col = col_map.get("unit_type",      None)
+        tenant_col = col_map.get("tenant",       None)
+
+        type_lock   = f" | Unit Type = col {type_col} (copy value as-is)" if type_col is not None else ""
+        tenant_lock = f" | Tenant Name = col {tenant_col}" if tenant_col is not None else ""
+
+        # If there's no charge_code column, this is a pre-calculated spreadsheet —
+        # Charge Amount IS the effective rent directly (no filtering by charge code needed)
+        if col_map.get("charge_code") is None:
+            col_lock = (
+                f"COLUMN LOCK — this file has pre-calculated rents (no charge code column).\n"
+                f"  Effective Rent = 'Charge Amount' column (col {amt_col}) directly — use as-is, no filtering.\n"
+                f"  Market Rent = col {mkt_col} (NEVER use as EffRent){type_lock}{tenant_lock}"
+            )
+        else:
+            col_lock = (
+                f"COLUMN LOCK — read Effective Rent from 'Charge Amount' (col {amt_col}) ONLY.\n"
+                f"  Charge Code = col {code_col} | Market Rent = col {mkt_col} (NEVER use as EffRent)"
+                f" | Deposit = col {dep_col} (NEVER use as EffRent){type_lock}{tenant_lock}"
+            )
     else:
         col_lock = "COLUMN RULE: EffRent = 'Charge Amount' where Charge Code = rent. Never use Market Rent or Deposit."
 
