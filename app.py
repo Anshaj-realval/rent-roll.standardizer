@@ -2107,27 +2107,6 @@ with main_tab:
 
             prog_ph.empty(); status_ph.empty()
 
-            # Store results in session_state so they survive download button reruns
-            st.session_state["result"] = {
-                "standardized_df": standardized_df,
-                "original_df":     original_df,
-                "col_map":         col_map,
-                "source_summary":  source_summary,
-                "sheet_name":      sheet_name,
-                "memory_ctx":      memory_ctx,
-                "file_name":       uploaded_file.name,
-            }
-
-        # ── Render results from session_state (persists across reruns) ──────
-        res = st.session_state.get("result")
-        if res and res.get("file_name") == uploaded_file.name:
-            standardized_df = res["standardized_df"]
-            original_df     = res["original_df"]
-            col_map         = res["col_map"]
-            source_summary  = res["source_summary"]
-            sheet_name      = res["sheet_name"]
-            memory_ctx      = res["memory_ctx"]
-
             # Show detected format as a small badge
             fmt = col_map.get("fmt", "unknown")
             fmt_labels = {"yardi": "Yardi / MRI", "appfolio": "AppFolio", "vesper": "Vesper / Sunbelt", "onsite": "OneSite / RealPage", "unknown": "Unknown"}
